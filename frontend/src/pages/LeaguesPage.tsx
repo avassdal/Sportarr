@@ -306,11 +306,7 @@ export default function LeaguesPage() {
               return (
                 <tr
                   key={league.id}
-                  onClick={() => {
-                    if (!isSelected) {
-                      navigate(`/leagues/${league.id}`);
-                    }
-                  }}
+                  onClick={() => navigate(`/leagues/${league.id}`)}
                   className={`${TABLE_ROW_HOVER} cursor-pointer ${
                     isSelected ? 'bg-red-900/20' : ''
                   }`}

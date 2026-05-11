@@ -91,6 +91,49 @@ public static class DatabaseInitializer
             Console.WriteLine($"[Sportarr] Warning: Could not verify Leagues.MonitoredParts column: {ex.Message}");
         }
 
+        // Ensure AlternateName column exists in Leagues table (added with
+        // the league-alternate-names matcher fix). For legacy databases
+        // created with EnsureCreated() the migration history was seeded
+        // upfront so EF skips the AddColumn migration; without this
+        // safety net the column never lands and every Leagues SELECT
+        // throws "no such column: AlternateName".
+        try
+        {
+            var checkLeagueAltSql = "SELECT COUNT(*) FROM pragma_table_info('Leagues') WHERE name='AlternateName'";
+            var leagueAltExists = db.Database.SqlQueryRaw<int>(checkLeagueAltSql).AsEnumerable().FirstOrDefault();
+            if (leagueAltExists == 0)
+            {
+                Console.WriteLine("[Sportarr] Leagues.AlternateName column missing - adding it now...");
+                db.Database.ExecuteSqlRaw("ALTER TABLE Leagues ADD COLUMN AlternateName TEXT");
+                Console.WriteLine("[Sportarr] Leagues.AlternateName column added successfully");
+            }
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"[Sportarr] Warning: Could not verify Leagues.AlternateName column: {ex.Message}");
+        }
+
+        // Ensure MetadataLastSyncedAt column exists in Leagues table.
+        // The auto-sync pipeline reads this to decide whether to
+        // re-pull league metadata from upstream; without the column
+        // every event sync would throw "no such column" on legacy DBs
+        // and event sync would be broken entirely.
+        try
+        {
+            var checkLeagueMetaSyncSql = "SELECT COUNT(*) FROM pragma_table_info('Leagues') WHERE name='MetadataLastSyncedAt'";
+            var leagueMetaSyncExists = db.Database.SqlQueryRaw<int>(checkLeagueMetaSyncSql).AsEnumerable().FirstOrDefault();
+            if (leagueMetaSyncExists == 0)
+            {
+                Console.WriteLine("[Sportarr] Leagues.MetadataLastSyncedAt column missing - adding it now...");
+                db.Database.ExecuteSqlRaw("ALTER TABLE Leagues ADD COLUMN MetadataLastSyncedAt TEXT");
+                Console.WriteLine("[Sportarr] Leagues.MetadataLastSyncedAt column added successfully");
+            }
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"[Sportarr] Warning: Could not verify Leagues.MetadataLastSyncedAt column: {ex.Message}");
+        }
+
         // Ensure MonitoredParts column exists in Events table (backwards compatibility fix)
         try
         {
@@ -129,6 +172,304 @@ public static class DatabaseInitializer
         catch (Exception ex)
         {
             Console.WriteLine($"[Sportarr] Warning: Could not verify Blocklist.FilePath column: {ex.Message}");
+        }
+
+        // Ensure the IPTV-org canonical-channel columns exist on
+        // IptvChannels. Added when the iptv-org sync service started
+        // assigning canonical "ESPN.us"-style ids to user channels;
+        // every IPTV channel query EF runs projects these columns,
+        // so legacy databases without them break the entire IPTV
+        // sources page on first sync.
+        try
+        {
+            var checkIptvOrgIdSql = "SELECT COUNT(*) FROM pragma_table_info('IptvChannels') WHERE name='IptvOrgId'";
+            var iptvOrgIdExists = db.Database.SqlQueryRaw<int>(checkIptvOrgIdSql).AsEnumerable().FirstOrDefault();
+            if (iptvOrgIdExists == 0)
+            {
+                Console.WriteLine("[Sportarr] IptvChannels.IptvOrgId column missing - adding it now...");
+                db.Database.ExecuteSqlRaw("ALTER TABLE IptvChannels ADD COLUMN IptvOrgId TEXT");
+                db.Database.ExecuteSqlRaw("CREATE INDEX IF NOT EXISTS IX_IptvChannels_IptvOrgId ON IptvChannels(IptvOrgId)");
+                Console.WriteLine("[Sportarr] IptvChannels.IptvOrgId column added successfully");
+            }
+
+            var checkIptvOrgConfSql = "SELECT COUNT(*) FROM pragma_table_info('IptvChannels') WHERE name='IptvOrgConfidence'";
+            var iptvOrgConfExists = db.Database.SqlQueryRaw<int>(checkIptvOrgConfSql).AsEnumerable().FirstOrDefault();
+            if (iptvOrgConfExists == 0)
+            {
+                Console.WriteLine("[Sportarr] IptvChannels.IptvOrgConfidence column missing - adding it now...");
+                db.Database.ExecuteSqlRaw("ALTER TABLE IptvChannels ADD COLUMN IptvOrgConfidence INTEGER");
+                Console.WriteLine("[Sportarr] IptvChannels.IptvOrgConfidence column added successfully");
+            }
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"[Sportarr] Warning: Could not verify IptvChannels iptv-org columns: {ex.Message}");
+        }
+
+        // Ensure the per-league DVR padding overrides exist on
+        // Leagues. Same rationale as above - EF projects these on
+        // every league query so a legacy DB without them breaks the
+        // league list, the auto-scheduler, and EventDvrService.
+        try
+        {
+            var checkPrePadSql = "SELECT COUNT(*) FROM pragma_table_info('Leagues') WHERE name='DvrPrePadMinutes'";
+            var prePadExists = db.Database.SqlQueryRaw<int>(checkPrePadSql).AsEnumerable().FirstOrDefault();
+            if (prePadExists == 0)
+            {
+                Console.WriteLine("[Sportarr] Leagues.DvrPrePadMinutes column missing - adding it now...");
+                db.Database.ExecuteSqlRaw("ALTER TABLE Leagues ADD COLUMN DvrPrePadMinutes INTEGER");
+                Console.WriteLine("[Sportarr] Leagues.DvrPrePadMinutes column added successfully");
+            }
+
+            var checkPostRollSql = "SELECT COUNT(*) FROM pragma_table_info('Leagues') WHERE name='DvrPostRollMinutes'";
+            var postRollExists = db.Database.SqlQueryRaw<int>(checkPostRollSql).AsEnumerable().FirstOrDefault();
+            if (postRollExists == 0)
+            {
+                Console.WriteLine("[Sportarr] Leagues.DvrPostRollMinutes column missing - adding it now...");
+                db.Database.ExecuteSqlRaw("ALTER TABLE Leagues ADD COLUMN DvrPostRollMinutes INTEGER");
+                Console.WriteLine("[Sportarr] Leagues.DvrPostRollMinutes column added successfully");
+            }
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"[Sportarr] Warning: Could not verify League DVR padding columns: {ex.Message}");
+        }
+
+        // Ensure the per-league preferred-channel uniqueness index
+        // exists on ChannelLeagueMappings. Filtered unique on
+        // (LeagueId) WHERE IsPreferred = 1 - prevents two preferred
+        // rows for the same league. Idempotent via IF NOT EXISTS.
+        try
+        {
+            db.Database.ExecuteSqlRaw(
+                "CREATE UNIQUE INDEX IF NOT EXISTS \"UX_ChannelLeagueMappings_PreferredPerLeague\" " +
+                "ON \"ChannelLeagueMappings\" (\"LeagueId\") WHERE \"IsPreferred\" = 1");
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"[Sportarr] Warning: Could not create UX_ChannelLeagueMappings_PreferredPerLeague index: {ex.Message}");
+        }
+
+        // Ensure RootFolderId column exists in Leagues table. Added so each
+        // league can be bound to a specific root folder at add time, instead
+        // of the importer reselecting one from the free-space heuristic on
+        // every import (which scattered a single league's events across
+        // multiple roots). Nullable so legacy leagues stay valid until the
+        // user picks a root for them.
+        try
+        {
+            var checkRootFolderIdSql = "SELECT COUNT(*) FROM pragma_table_info('Leagues') WHERE name='RootFolderId'";
+            var rootFolderIdExists = db.Database.SqlQueryRaw<int>(checkRootFolderIdSql).AsEnumerable().FirstOrDefault();
+
+            if (rootFolderIdExists == 0)
+            {
+                Console.WriteLine("[Sportarr] Leagues.RootFolderId column missing - adding it now...");
+                db.Database.ExecuteSqlRaw("ALTER TABLE Leagues ADD COLUMN RootFolderId INTEGER");
+                db.Database.ExecuteSqlRaw("CREATE INDEX IF NOT EXISTS IX_Leagues_RootFolderId ON Leagues(RootFolderId)");
+                Console.WriteLine("[Sportarr] Leagues.RootFolderId column added successfully");
+            }
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"[Sportarr] Warning: Could not verify Leagues.RootFolderId column: {ex.Message}");
+        }
+
+        // Backfill Events.BroadcastDate for legacy rows that were
+        // synced via lookup/search/team-schedule/livescore code paths
+        // before BroadcastDate was populated everywhere. Without a
+        // BroadcastDate, EventQueryService falls back to the UTC
+        // EventDate.Date, which produces a wrong-month query for
+        // late-Eastern games whose UTC instant rolls over to the
+        // next day (the user's NHL Ducks/Oilers Game 6 case:
+        // 2am BST event was titled with 30.04 in the release file
+        // but Sportarr queried 05 because EventDate is 2026-05-01Z).
+        // Use UTC EventDate.Date as the backfill - the next normal
+        // sync will replace it with the correct venue-local date if
+        // the API supplies one. Idempotent.
+        try
+        {
+            var rows = db.Database.ExecuteSqlRaw(
+                "UPDATE Events SET BroadcastDate = date(EventDate) " +
+                "WHERE BroadcastDate IS NULL AND EventDate IS NOT NULL");
+            if (rows > 0)
+            {
+                Console.WriteLine($"[Sportarr] Backfilled BroadcastDate on {rows} legacy event row(s)");
+            }
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"[Sportarr] Warning: Could not backfill Events.BroadcastDate: {ex.Message}");
+        }
+
+        // Normalize Leagues.Sport casing. The upstream metadata API
+        // is inconsistent on this column - some leagues ship as
+        // "Motorsport" and a handful as "MotorSport", which renders
+        // as two separate sport chips on the Add League page (the
+        // filter dedups by string equality, not case-insensitively).
+        // Canonicalize known case-variants once at startup so the
+        // chip list stays single-entry without code paths having to
+        // handle both shapes downstream. Idempotent - the COLLATE
+        // NOCASE comparison only matches rows whose case differs
+        // from the canonical form.
+        try
+        {
+            var sportCanonicals = new[]
+            {
+                "Motorsport",
+                "Soccer",
+                "American Football",
+                "Basketball",
+                "Baseball",
+                "Ice Hockey",
+                "Fighting",
+                "Rugby",
+                "Cricket",
+                "Tennis",
+                "Golf",
+            };
+            foreach (var canonical in sportCanonicals)
+            {
+                var rowsAffected = db.Database.ExecuteSqlRaw(
+                    $"UPDATE Leagues SET Sport = '{canonical}' WHERE Sport = '{canonical}' COLLATE NOCASE AND Sport != '{canonical}'");
+                if (rowsAffected > 0)
+                {
+                    Console.WriteLine($"[Sportarr] Normalized {rowsAffected} Leagues.Sport row(s) to '{canonical}'");
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"[Sportarr] Warning: Could not normalize Leagues.Sport casing: {ex.Message}");
+        }
+
+        // Ensure the plain-RSS indexer columns exist on Indexers. Added so
+        // the Generic Torrent RSS Feed indexer type can persist its
+        // auto-detected parser config (size source, ezRSS format flag,
+        // enclosure-URL preference, etc.) and an optional cookie. Eight
+        // columns; we add them in one block per pragma_table_info pattern
+        // so legacy EnsureCreated databases pick them up at the next start.
+        try
+        {
+            var rssCols = new (string Name, string Type, string Default)[]
+            {
+                ("Cookie",                          "TEXT",    ""),
+                ("RssAllowZeroSize",                "INTEGER", "0"),
+                ("RssUseEzrssFormat",               "INTEGER", "0"),
+                ("RssUseEnclosureUrl",              "INTEGER", "1"),
+                ("RssUseEnclosureLength",           "INTEGER", "1"),
+                ("RssParseSizeInDescription",       "INTEGER", "0"),
+                ("RssParseSeedersInDescription",    "INTEGER", "0"),
+                ("RssSizeElementName",              "TEXT",    ""),
+            };
+            foreach (var col in rssCols)
+            {
+                var checkSql = $"SELECT COUNT(*) FROM pragma_table_info('Indexers') WHERE name='{col.Name}'";
+                var exists = db.Database.SqlQueryRaw<int>(checkSql).AsEnumerable().FirstOrDefault();
+                if (exists == 0)
+                {
+                    var defaultClause = col.Type == "TEXT" ? "" : $" NOT NULL DEFAULT {col.Default}";
+                    Console.WriteLine($"[Sportarr] Indexers.{col.Name} column missing - adding it now...");
+                    db.Database.ExecuteSqlRaw($"ALTER TABLE Indexers ADD COLUMN {col.Name} {col.Type}{defaultClause}");
+                    Console.WriteLine($"[Sportarr] Indexers.{col.Name} column added successfully");
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"[Sportarr] Warning: Could not verify Indexers RSS columns: {ex.Message}");
+        }
+
+        // FailDownloads policy on Indexers (per-indexer JSON list of int
+        // enum values) and the matching UserRejectedExtensions free-form
+        // list on MediaManagementSettings. Both default to "no opinion" —
+        // FailDownloads = "[]" means warn-only behavior, and a null
+        // UserRejectedExtensions means the UserDefinedExtensions
+        // category is effectively unused even when checked on an indexer.
+        try
+        {
+            var checkFailDownloads = "SELECT COUNT(*) FROM pragma_table_info('Indexers') WHERE name='FailDownloads'";
+            if (db.Database.SqlQueryRaw<int>(checkFailDownloads).AsEnumerable().FirstOrDefault() == 0)
+            {
+                Console.WriteLine("[Sportarr] Indexers.FailDownloads column missing - adding it now...");
+                db.Database.ExecuteSqlRaw("ALTER TABLE Indexers ADD COLUMN FailDownloads TEXT NOT NULL DEFAULT '[]'");
+                Console.WriteLine("[Sportarr] Indexers.FailDownloads column added successfully");
+            }
+
+            var checkUserRejected = "SELECT COUNT(*) FROM pragma_table_info('MediaManagementSettings') WHERE name='UserRejectedExtensions'";
+            if (db.Database.SqlQueryRaw<int>(checkUserRejected).AsEnumerable().FirstOrDefault() == 0)
+            {
+                Console.WriteLine("[Sportarr] MediaManagementSettings.UserRejectedExtensions column missing - adding it now...");
+                db.Database.ExecuteSqlRaw("ALTER TABLE MediaManagementSettings ADD COLUMN UserRejectedExtensions TEXT");
+                Console.WriteLine("[Sportarr] MediaManagementSettings.UserRejectedExtensions column added successfully");
+            }
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"[Sportarr] Warning: Could not verify FailDownloads columns: {ex.Message}");
+        }
+
+        // Drop the legacy persisted live-state columns from RootFolders.
+        // These were previously persisted (Accessible / FreeSpace / TotalSpace
+        // / LastChecked) but Phase 3 of the root-folders rework moved them to
+        // [NotMapped] live-only fields. The drop migration handles fresh
+        // installs; this safety net handles legacy databases that were
+        // originally created with EnsureCreated() — the migration-history
+        // seeder marks every migration as applied without actually running
+        // the DropColumn, so the NOT NULL columns survive and INSERTs from
+        // the [NotMapped] model fail with a constraint violation. SQLite
+        // 3.35+ supports ALTER TABLE DROP COLUMN; we wrap each call in its
+        // own try/catch so an older sqlite or an already-dropped column
+        // never aborts startup.
+        foreach (var legacyCol in new[] { "Accessible", "FreeSpace", "TotalSpace", "LastChecked" })
+        {
+            try
+            {
+                var checkSql = $"SELECT COUNT(*) FROM pragma_table_info('RootFolders') WHERE name='{legacyCol}'";
+                var exists = db.Database.SqlQueryRaw<int>(checkSql).AsEnumerable().FirstOrDefault();
+                if (exists > 0)
+                {
+                    Console.WriteLine($"[Sportarr] Legacy RootFolders.{legacyCol} column found - dropping it now...");
+                    db.Database.ExecuteSqlRaw($"ALTER TABLE RootFolders DROP COLUMN {legacyCol}");
+                    Console.WriteLine($"[Sportarr] RootFolders.{legacyCol} column dropped successfully");
+                }
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"[Sportarr] Warning: Could not drop RootFolders.{legacyCol}: {ex.Message}");
+            }
+        }
+
+        // Ensure RootFolders has the per-root default columns. Added so a
+        // user can pin a Quality Profile and a Download Client category to
+        // each root (e.g. fast SSD with 2160p profile + "live" category;
+        // archive HDD with 1080p profile + "archive" category). Both
+        // nullable: empty means "use global default", so existing setups
+        // continue to work unchanged.
+        try
+        {
+            var checkDefaultProfileSql = "SELECT COUNT(*) FROM pragma_table_info('RootFolders') WHERE name='DefaultQualityProfileId'";
+            var defaultProfileExists = db.Database.SqlQueryRaw<int>(checkDefaultProfileSql).AsEnumerable().FirstOrDefault();
+
+            if (defaultProfileExists == 0)
+            {
+                Console.WriteLine("[Sportarr] RootFolders.DefaultQualityProfileId column missing - adding it now...");
+                db.Database.ExecuteSqlRaw("ALTER TABLE RootFolders ADD COLUMN DefaultQualityProfileId INTEGER");
+                Console.WriteLine("[Sportarr] RootFolders.DefaultQualityProfileId column added successfully");
+            }
+
+            var checkDefaultCategorySql = "SELECT COUNT(*) FROM pragma_table_info('RootFolders') WHERE name='DefaultDownloadClientCategory'";
+            var defaultCategoryExists = db.Database.SqlQueryRaw<int>(checkDefaultCategorySql).AsEnumerable().FirstOrDefault();
+
+            if (defaultCategoryExists == 0)
+            {
+                Console.WriteLine("[Sportarr] RootFolders.DefaultDownloadClientCategory column missing - adding it now...");
+                db.Database.ExecuteSqlRaw("ALTER TABLE RootFolders ADD COLUMN DefaultDownloadClientCategory TEXT");
+                Console.WriteLine("[Sportarr] RootFolders.DefaultDownloadClientCategory column added successfully");
+            }
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"[Sportarr] Warning: Could not verify RootFolders default columns: {ex.Message}");
         }
 
         // Ensure DisableSslCertificateValidation column exists in DownloadClients table (backwards compatibility fix)
@@ -864,6 +1205,64 @@ public static class DatabaseInitializer
             Console.WriteLine($"[Sportarr] Warning: Could not verify EventFiles.ReleaseGroup column: {ex.Message}");
         }
 
+        // Ensure Languages column exists in EventFiles table (audio/subtitle languages, JSON list).
+        // Defaults to "[]" so existing rows materialize as empty lists.
+        try
+        {
+            var checkLangColumnSql = "SELECT COUNT(*) FROM pragma_table_info('EventFiles') WHERE name='Languages'";
+            var langColumnExists = db.Database.SqlQueryRaw<int>(checkLangColumnSql).AsEnumerable().FirstOrDefault();
+
+            if (langColumnExists == 0)
+            {
+                Console.WriteLine("[Sportarr] EventFiles.Languages column missing - adding it now...");
+                db.Database.ExecuteSqlRaw("ALTER TABLE EventFiles ADD COLUMN Languages TEXT NOT NULL DEFAULT '[]'");
+                Console.WriteLine("[Sportarr] EventFiles.Languages column added successfully");
+            }
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"[Sportarr] Warning: Could not verify EventFiles.Languages column: {ex.Message}");
+        }
+
+        // Ensure IndexerFlags column exists in EventFiles table (Freeleech/Internal/Scene/Nuked tokens).
+        try
+        {
+            var checkIfColumnSql = "SELECT COUNT(*) FROM pragma_table_info('EventFiles') WHERE name='IndexerFlags'";
+            var ifColumnExists = db.Database.SqlQueryRaw<int>(checkIfColumnSql).AsEnumerable().FirstOrDefault();
+
+            if (ifColumnExists == 0)
+            {
+                Console.WriteLine("[Sportarr] EventFiles.IndexerFlags column missing - adding it now...");
+                db.Database.ExecuteSqlRaw("ALTER TABLE EventFiles ADD COLUMN IndexerFlags TEXT");
+                Console.WriteLine("[Sportarr] EventFiles.IndexerFlags column added successfully");
+            }
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"[Sportarr] Warning: Could not verify EventFiles.IndexerFlags column: {ex.Message}");
+        }
+
+        // Ensure MissingSince column exists in EventFiles table (grace-period
+        // tracking for files that go transiently unreachable; disk scanner
+        // uses this with Config.EventFileMissingDeleteAfterDays before doing
+        // any hard-delete).
+        try
+        {
+            var checkMsColumnSql = "SELECT COUNT(*) FROM pragma_table_info('EventFiles') WHERE name='MissingSince'";
+            var msColumnExists = db.Database.SqlQueryRaw<int>(checkMsColumnSql).AsEnumerable().FirstOrDefault();
+
+            if (msColumnExists == 0)
+            {
+                Console.WriteLine("[Sportarr] EventFiles.MissingSince column missing - adding it now...");
+                db.Database.ExecuteSqlRaw("ALTER TABLE EventFiles ADD COLUMN MissingSince TEXT");
+                Console.WriteLine("[Sportarr] EventFiles.MissingSince column added successfully");
+            }
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"[Sportarr] Warning: Could not verify EventFiles.MissingSince column: {ex.Message}");
+        }
+
         // Ensure DownloadId column exists in GrabHistory table (for external download detection)
         try
         {
@@ -948,6 +1347,52 @@ public static class DatabaseInitializer
         catch (Exception ex)
         {
             Console.WriteLine($"[Sportarr] Warning: Could not verify Tags columns: {ex.Message}");
+        }
+
+        // Backfill: rewrite legacy www.thesportsdb.com image URLs to the
+        // r2.thesportsdb.com mirror. The legacy host returns 404 for
+        // image requests after TheSportsDB's CDN migration; existing
+        // rows that were written before ImageUrlNormalizer was wired
+        // into the model setters keep the dead URL until something
+        // resaves them. One-time UPDATE per startup, idempotent
+        // (rows already on r2 don't match the LIKE filter), safe to
+        // re-run.
+        try
+        {
+            var imageUrlBackfills = new[]
+            {
+                ("Leagues",      new[] { "LogoUrl", "BannerUrl", "PosterUrl" }),
+                ("Teams",        new[] { "BadgeUrl", "JerseyUrl", "BannerUrl" }),
+                ("Events",       new[] { "PosterUrl", "ThumbUrl", "BannerUrl", "FanartUrl" }),
+            };
+            int totalRowsRewritten = 0;
+            foreach (var (table, columns) in imageUrlBackfills)
+            {
+                foreach (var col in columns)
+                {
+                    // Skip silently when the column doesn't exist on a
+                    // legacy DB — Tags / etc. follow the same pattern.
+                    var colExistsSql = $"SELECT COUNT(*) FROM pragma_table_info('{table}') WHERE name='{col}'";
+                    var colExists = db.Database.SqlQueryRaw<int>(colExistsSql).AsEnumerable().FirstOrDefault();
+                    if (colExists == 0) continue;
+
+                    var sql = $"UPDATE \"{table}\" SET \"{col}\" = REPLACE(\"{col}\", 'www.thesportsdb.com/images/', 'r2.thesportsdb.com/images/') WHERE \"{col}\" LIKE '%www.thesportsdb.com/images/%'";
+                    var rows = db.Database.ExecuteSqlRaw(sql);
+                    if (rows > 0)
+                    {
+                        Console.WriteLine($"[Sportarr] Backfilled {rows} {table}.{col} URLs to r2.thesportsdb.com mirror");
+                        totalRowsRewritten += rows;
+                    }
+                }
+            }
+            if (totalRowsRewritten > 0)
+            {
+                Console.WriteLine($"[Sportarr] Image-URL backfill complete: {totalRowsRewritten} rows updated total");
+            }
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"[Sportarr] Warning: Could not backfill legacy image URLs: {ex.Message}");
         }
 
         // Clean up orphaned events (events whose leagues no longer exist)

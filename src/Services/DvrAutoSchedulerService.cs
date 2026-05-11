@@ -330,15 +330,23 @@ public class DvrAutoSchedulerService : BackgroundService
 
             try
             {
+                // Resolve padding from league override + sport defaults.
+                var pad = Sportarr.Api.Helpers.DvrPaddingDefaults.Resolve(
+                    evt.League?.Sport,
+                    evt.League?.DvrPrePadMinutes,
+                    evt.League?.DvrPostRollMinutes,
+                    fallbackPre: 5,
+                    fallbackPost: 30);
+
                 // Schedule recording using the EPG program times
                 var recording = await dvrService.ScheduleRecordingAsync(new ScheduleDvrRecordingRequest
                 {
                     EventId = evt.Id,
                     ChannelId = channel.Id,
-                    ScheduledStart = matchingProgram.StartTime.AddMinutes(-5), // Pre-padding
-                    ScheduledEnd = matchingProgram.EndTime.AddMinutes(30), // Post-padding
-                    PrePadding = 5,
-                    PostPadding = 30
+                    ScheduledStart = matchingProgram.StartTime.AddMinutes(-pad.PrePadMinutes),
+                    ScheduledEnd = matchingProgram.EndTime.AddMinutes(pad.PostRollMinutes),
+                    PrePadding = pad.PrePadMinutes,
+                    PostPadding = pad.PostRollMinutes
                 });
 
                 if (recording != null)

@@ -60,6 +60,7 @@ interface LeagueDetail {
   monitored: boolean;
   monitorType?: string;
   qualityProfileId?: number;
+  rootFolderId?: number | null;
   searchForMissingEvents?: boolean;
   searchForCutoffUnmetEvents?: boolean;
   monitoredParts?: string;
@@ -226,6 +227,13 @@ export default function LeagueDetailPage() {
   const [showDeleteConfirm, setShowDeleteConfirm] = useState(false);
   const [deleteLeagueFolder, setDeleteLeagueFolder] = useState(false);
   const [revealedScores, setRevealedScores] = useState<Set<number>>(new Set());
+  // Move league modal state. Lives at the page level so the existing
+  // page query / refetchOnSettle pattern can drive it.
+  const [showMoveModal, setShowMoveModal] = useState(false);
+  const [moveTargetRootId, setMoveTargetRootId] = useState<number | null>(null);
+  const [moveFiles, setMoveFiles] = useState(true);
+  const [isMoving, setIsMoving] = useState(false);
+  const [moveError, setMoveError] = useState<string | null>(null);
 
   // CRITICAL: Store stable modal data in refs to prevent modal unmounting during query refetch
   // When queryClient.invalidateQueries runs, the league data might briefly become undefined,
@@ -288,6 +296,17 @@ export default function LeagueDetailPage() {
       const response = await apiClient.get<QualityProfile[]>('/qualityprofile');
       return response.data;
     },
+  });
+
+  // Fetch root folders for the Move League modal. Same shape as
+  // AddLeagueModal so the user picks from the same list.
+  const { data: rootFolders = [] } = useQuery({
+    queryKey: ['root-folders'],
+    queryFn: async () => {
+      const response = await apiClient.get<Array<{ id: number; path: string; accessible: boolean; freeSpace: number; totalSpace: number }>>('/rootfolder');
+      return response.data;
+    },
+    staleTime: 60_000,
   });
 
   // Check if IPTV sources exist (to conditionally show DVR section)
@@ -651,7 +670,14 @@ export default function LeagueDetailPage() {
     monitoredEventTypes: string | null,
     searchQueryTemplate: string | null,
     tags: number[],
+    // Edit modal hides the root-folder picker (changing root requires
+    // moving files; that's the move-league flow scheduled for the next
+    // phase). Param is accepted to keep the modal's onAdd signature
+    // stable but ignored here.
+    _rootFolderId: number | null,
   ) => {
+    void _rootFolderId;
+    void league;
     updateLeagueSettingsMutation.mutate({
       monitoredTeamIds,
       monitorType,
@@ -720,6 +746,96 @@ export default function LeagueDetailPage() {
       deleteModalDataRef.current = null;
     }, 300);
   };
+
+  // Move League: PUT /api/leagues/{id}/move with the picked rootFolderId
+  // and the moveFiles flag. The endpoint either succeeds (200), reports a
+  // conflict on collision (409), or surfaces a 4xx with a message we just
+  // forward to the user.
+  const openMoveModal = () => {
+    if (!league) return;
+    setMoveError(null);
+    setMoveFiles(true);
+    setMoveTargetRootId(
+      // Prefer the league's current binding so the dropdown opens on the
+      // existing folder; otherwise default to the first accessible root.
+      league.rootFolderId
+        ?? rootFolders.find((rf) => rf.accessible)?.id
+        ?? null
+    );
+    setShowMoveModal(true);
+  };
+
+  const closeMoveModal = () => {
+    if (isMoving) return;
+    setShowMoveModal(false);
+    setMoveError(null);
+  };
+
+  const submitMove = async () => {
+    if (!league || moveTargetRootId == null) return;
+    setIsMoving(true);
+    setMoveError(null);
+    try {
+      const response = await apiClient.put(`/leagues/${league.id}/move`, {
+        rootFolderId: moveTargetRootId,
+        moveFiles,
+      });
+      const data = response.data as { filesMoved?: number; oldPath?: string; newPath?: string };
+      const moved = data?.filesMoved ?? 0;
+      toast.success(
+        moved > 0
+          ? `Moved ${moved} file${moved === 1 ? '' : 's'} → ${data.newPath ?? 'new root folder'}`
+          : 'League root folder updated.'
+      );
+      setShowMoveModal(false);
+      await queryClient.invalidateQueries({ queryKey: ['league', id] });
+      await queryClient.invalidateQueries({ queryKey: ['root-folders'] });
+    } catch (err: unknown) {
+      const error = err as { response?: { data?: { error?: string } } };
+      setMoveError(error?.response?.data?.error ?? 'Move failed. Check the server logs for details.');
+    } finally {
+      setIsMoving(false);
+    }
+  };
+
+  // Reorganize-and-move: when the regular move was rejected because
+  // the league's files live under multiple root folders, the user can
+  // run this action to consolidate every file under the picked target
+  // root before the move proceeds. The backend also updates the
+  // league's root binding, so afterwards the league is fully on the
+  // target root with no follow-up needed.
+  const submitReorganize = async () => {
+    if (!league || moveTargetRootId == null) return;
+    setIsMoving(true);
+    setMoveError(null);
+    try {
+      const response = await apiClient.post(`/leagues/${league.id}/reorganize`, {
+        rootFolderId: moveTargetRootId,
+      });
+      const data = response.data as { filesMoved?: number; newPath?: string; message?: string };
+      const moved = data?.filesMoved ?? 0;
+      toast.success(
+        moved > 0
+          ? `Reorganized ${moved} file${moved === 1 ? '' : 's'} → ${data.newPath ?? 'target root'}`
+          : data?.message ?? 'League root folder updated.'
+      );
+      setShowMoveModal(false);
+      await queryClient.invalidateQueries({ queryKey: ['league', id] });
+      await queryClient.invalidateQueries({ queryKey: ['root-folders'] });
+    } catch (err: unknown) {
+      const error = err as { response?: { data?: { error?: string } } };
+      setMoveError(error?.response?.data?.error ?? 'Reorganize failed. Check the server logs for details.');
+    } finally {
+      setIsMoving(false);
+    }
+  };
+
+  // Show the "Reorganize and move" button when the most recent move
+  // attempt was blocked because files span multiple root folders.
+  // We match on the marker phrase from the backend message rather
+  // than wiring a separate status code, which keeps the contract
+  // permissive for future error wording tweaks.
+  const canReorganize = !!moveError && /spread across multiple root folders/i.test(moveError);
 
   const handleManualSearch = (eventId: number, eventTitle: string, part?: string, existingFiles?: EventFile[]) => {
     setManualSearchModal({
@@ -1150,6 +1266,15 @@ export default function LeagueDetailPage() {
               >
                 <UsersIcon className="h-4 w-4" />
                 Edit
+              </button>
+              <button
+                onClick={openMoveModal}
+                disabled={rootFolders.length === 0}
+                className={BUTTON_SECONDARY}
+                title="Move this league's media folder to a different root folder"
+              >
+                <FolderOpenIcon className="h-4 w-4" />
+                Move
               </button>
               <button
                 onClick={openDeleteConfirm}
@@ -2535,6 +2660,96 @@ export default function LeagueDetailPage() {
                 className="px-4 py-2 bg-red-600 text-white rounded-lg hover:bg-red-700 font-semibold transition-colors disabled:opacity-50"
               >
                 {deleteLeagueMutation.isPending ? 'Removing...' : (deleteLeagueFolder ? 'Remove & Delete Files' : 'Remove League')}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Move League Modal */}
+      {showMoveModal && league && (
+        <div className="fixed inset-0 bg-black/70 flex items-center justify-center z-50">
+          <div className="bg-gray-900 border border-red-900/50 rounded-lg p-6 max-w-lg w-full mx-4 shadow-2xl">
+            <h2 className="text-xl font-bold text-white mb-4">Move League to a Different Root Folder</h2>
+            <p className="text-gray-400 mb-4">
+              Choose where <span className="text-white font-medium">"{league.name}"</span> should live going forward. New events imported into this league will be placed under the selected root folder.
+            </p>
+
+            <label className="block text-sm font-medium text-gray-300 mb-2">Target Root Folder</label>
+            <select
+              value={moveTargetRootId ?? ''}
+              onChange={(e) => setMoveTargetRootId(e.target.value ? parseInt(e.target.value) : null)}
+              disabled={isMoving}
+              className="w-full px-3 py-2 mb-4 bg-black border border-red-900/30 rounded-lg text-white focus:outline-none focus:border-red-600 focus:ring-1 focus:ring-red-600 disabled:opacity-50"
+            >
+              <option value="">Select a root folder…</option>
+              {rootFolders.map(rf => {
+                const freeGiB = rf.freeSpace > 0 ? (rf.freeSpace / (1024 ** 3)).toFixed(1) : '?';
+                const status = rf.accessible ? '' : ' (inaccessible)';
+                const current = rf.id === league.rootFolderId ? ' • current' : '';
+                return (
+                  <option key={rf.id} value={rf.id} disabled={!rf.accessible}>
+                    {rf.path} — {freeGiB} GiB free{status}{current}
+                  </option>
+                );
+              })}
+            </select>
+
+            <label className="flex items-start gap-3 mb-4 cursor-pointer group">
+              <div className="relative flex items-center">
+                <input
+                  type="checkbox"
+                  checked={moveFiles}
+                  onChange={(e) => setMoveFiles(e.target.checked)}
+                  disabled={isMoving}
+                  className="sr-only"
+                />
+                <div className={`w-5 h-5 rounded border-2 flex items-center justify-center transition-colors ${
+                  moveFiles
+                    ? 'bg-red-600 border-red-600'
+                    : 'border-gray-500 group-hover:border-gray-400'
+                }`}>
+                  {moveFiles && <CheckIcon className="h-3 w-3 text-white" />}
+                </div>
+              </div>
+              <div>
+                <span className="text-white font-medium">Move existing files to the new folder</span>
+                <p className="text-gray-500 text-sm">
+                  When checked, the league's on-disk media folder is moved to the new root and every file path is updated. When unchecked, only the binding changes — existing files stay where they are and you take responsibility for relocating them manually.
+                </p>
+              </div>
+            </label>
+
+            {moveError && (
+              <div className="bg-red-900/30 border border-red-600/50 rounded-lg p-3 mb-4">
+                <p className="text-red-400 text-sm whitespace-pre-wrap">{moveError}</p>
+              </div>
+            )}
+
+            <div className="flex justify-end gap-3">
+              <button
+                onClick={closeMoveModal}
+                disabled={isMoving}
+                className="px-4 py-2 bg-gray-700 text-white rounded-lg hover:bg-gray-600 font-semibold transition-colors disabled:opacity-50"
+              >
+                Cancel
+              </button>
+              {canReorganize && (
+                <button
+                  onClick={submitReorganize}
+                  disabled={isMoving || moveTargetRootId == null}
+                  className="px-4 py-2 bg-amber-600 text-white rounded-lg hover:bg-amber-700 font-semibold transition-colors disabled:opacity-50"
+                  title="Move every file that currently lives outside the target root onto the target, preserving each file's relative path under its current root."
+                >
+                  {isMoving ? 'Reorganizing…' : 'Reorganize and Move'}
+                </button>
+              )}
+              <button
+                onClick={submitMove}
+                disabled={isMoving || moveTargetRootId == null || moveTargetRootId === league.rootFolderId}
+                className="px-4 py-2 bg-red-600 text-white rounded-lg hover:bg-red-700 font-semibold transition-colors disabled:opacity-50"
+              >
+                {isMoving ? 'Moving…' : (moveFiles ? 'Move League & Files' : 'Update Binding')}
               </button>
             </div>
           </div>

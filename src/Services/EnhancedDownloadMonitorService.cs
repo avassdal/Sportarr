@@ -205,11 +205,82 @@ public class EnhancedDownloadMonitorService : BackgroundService
             _logger.LogDebug("[Enhanced Download Monitor] Retrying import for pending download: {Title} (attempt {Count})",
                 download.Title, (download.ImportRetryCount ?? 0) + 1);
 
+            // Re-check the download client first. The data on disk may
+            // have disappeared between the time we last saw "complete"
+            // and now (qbit's missingFiles state for torrents whose
+            // content was moved/deleted; SAB removing the history
+            // entry; debrid orphan-cleanup running). Without this
+            // check we waste 3 import retries (~2 minutes) per cycle
+            // attempting to read a path the client has already given
+            // up on. If the client now reports the download as failed
+            // or no longer present, route to HandleFailedDownload
+            // immediately so the Blocklist entry, qbit removal, and
+            // re-search trigger fire on the FIRST poll instead of the
+            // 4th.
+            if (download.DownloadClient != null && !string.IsNullOrEmpty(download.DownloadId))
+            {
+                try
+                {
+                    var clientStatus = await downloadClientService.GetDownloadStatusAsync(
+                        download.DownloadClient,
+                        download.DownloadId);
+
+                    var clientReportsFailure = clientStatus != null &&
+                        string.Equals(clientStatus.Status, "failed", StringComparison.OrdinalIgnoreCase);
+
+                    if (clientReportsFailure)
+                    {
+                        _logger.LogWarning(
+                            "[Enhanced Download Monitor] Download client now reports {Title} as failed ({Reason}); short-circuiting import retry loop.",
+                            download.Title, clientStatus!.ErrorMessage ?? "no detail");
+                        download.Status = DownloadStatus.Failed;
+                        download.ErrorMessage = clientStatus.ErrorMessage ?? "Download client reports data missing";
+                        await HandleFailedDownload(
+                            download,
+                            downloadClientService,
+                            db,
+                            redownloadFailed,
+                            redownloadFailedFromInteractive);
+                        return;
+                    }
+                }
+                catch (Exception ex)
+                {
+                    // Client query failed - log but fall through to
+                    // the import retry. We don't want a transient
+                    // download-client outage to mark every pending
+                    // import as failed.
+                    _logger.LogDebug(ex,
+                        "[Enhanced Download Monitor] Could not re-query download client for {Title} during import retry; proceeding with retry anyway",
+                        download.Title);
+                }
+            }
+
+            // Capture the status before the import retry so we can
+            // detect the same Failed transition the long path
+            // handles below. Without this, when attempt N/N flips
+            // status to Failed inside HandleCompletedDownload, the
+            // early `return` on the next line skips the
+            // HandleFailedDownload call at line 414 and the
+            // download silently rots in Failed state with no
+            // blocklist entry, no re-search, and no notification.
+            var previousImportPendingStatus = download.Status;
             await HandleCompletedDownload(
                 download,
                 downloadClientService,
                 fileImportService,
                 db);
+
+            if (download.Status == DownloadStatus.Failed
+                && previousImportPendingStatus != DownloadStatus.Failed)
+            {
+                await HandleFailedDownload(
+                    download,
+                    downloadClientService,
+                    db,
+                    redownloadFailed,
+                    redownloadFailedFromInteractive);
+            }
             return;
         }
 
@@ -569,6 +640,38 @@ public class EnhancedDownloadMonitorService : BackgroundService
                 _logger.LogDebug("[Enhanced Download Monitor] Skipped removal from download client: No download client associated with {Title}",
                     download.Title);
             }
+        }
+        catch (IndexerFailDownloadException ex)
+        {
+            // FailDownloads policy match. Skip the retry-count loop —
+            // pin to Failed so the next monitor pass takes the
+            // status-transition path in HandleFailedDownload, which
+            // adds to the blocklist and (if redownloadFailed is on)
+            // schedules a re-search. Bumping ImportRetryCount here
+            // would burn the retry budget on a release that's never
+            // going to import successfully.
+            _logger.LogWarning(
+                "[Enhanced Download Monitor] ✗ FailDownloads policy fired ({Reason}) for {Title}: {Message}",
+                ex.Reason, download.Title, ex.Message);
+            download.Status = DownloadStatus.Failed;
+            download.ErrorMessage = ex.Message;
+        }
+        catch (DownloadFailedException ex)
+        {
+            // The download client itself flagged this as failed (e.g.
+            // SAB renamed the folder _FAILED_<x> after a par2/unpack
+            // post-processing failure). Same routing as the
+            // FailDownloads policy match: skip retries and pin to
+            // Failed so HandleFailedDownload's status-transition path
+            // blocklists the release and schedules a re-search. Without
+            // this branch the import would re-attempt 3× into an empty
+            // folder, never blocklist, and the next RSS sync would
+            // re-grab the same broken NZB indefinitely.
+            _logger.LogWarning(
+                "[Enhanced Download Monitor] ✗ Download client reported failure for {Title}: {Message}",
+                download.Title, ex.Message);
+            download.Status = DownloadStatus.Failed;
+            download.ErrorMessage = ex.Message;
         }
         catch (Exception ex)
         {

@@ -256,6 +256,12 @@ app.MapGet("/api/leagues/{id:int}/files", async (int id, SportarrDbContext db, I
             quality = f.Quality,
             qualityScore = f.QualityScore,
             customFormatScore = f.CustomFormatScore,
+            codec = f.Codec,
+            source = f.Source,
+            releaseGroup = f.ReleaseGroup,
+            originalTitle = f.OriginalTitle,
+            languages = f.Languages,
+            indexerFlags = f.IndexerFlags,
             partName = f.PartName,
             partNumber = f.PartNumber,
             added = f.Added,
@@ -309,6 +315,12 @@ app.MapGet("/api/leagues/{id:int}/seasons/{season}/files", async (int id, string
             quality = f.Quality,
             qualityScore = f.QualityScore,
             customFormatScore = f.CustomFormatScore,
+            codec = f.Codec,
+            source = f.Source,
+            releaseGroup = f.ReleaseGroup,
+            originalTitle = f.OriginalTitle,
+            languages = f.Languages,
+            indexerFlags = f.IndexerFlags,
             partName = f.PartName,
             partNumber = f.PartNumber,
             added = f.Added,
@@ -1140,6 +1152,66 @@ app.MapPost("/api/leagues", async (HttpContext context, SportarrDbContext db, IS
             return Results.BadRequest(new { error = "League already exists in library" });
         }
 
+        // Resolve which RootFolder this league binds to. Explicit selection
+        // wins; if the request didn't include one and exactly one folder is
+        // configured we default to it (single-root setups don't need a
+        // picker). Zero folders configured is a hard error so the user
+        // doesn't end up with a league that can't import. Multiple folders
+        // configured but no selection leaves the column null and the
+        // importer falls back to the free-space heuristic — preserves the
+        // legacy behavior for older clients that don't yet send the field.
+        var allRootFolders = await db.RootFolders.ToListAsync();
+
+        RootFolder? boundFolder = null;
+        if (league.RootFolderId.HasValue)
+        {
+            boundFolder = allRootFolders.FirstOrDefault(rf => rf.Id == league.RootFolderId.Value);
+            if (boundFolder == null)
+            {
+                logger.LogWarning("[LEAGUES] Rejected: rootFolderId={Id} doesn't exist", league.RootFolderId.Value);
+                return Results.BadRequest(new { error = $"Root folder {league.RootFolderId.Value} does not exist." });
+            }
+            // Re-check live accessibility — the persisted Accessible flag was
+            // dropped in Phase 3, but POST happens often enough that we
+            // verify directly here instead of doing a full RefreshLiveState
+            // for a single row.
+            if (!Directory.Exists(boundFolder.Path))
+            {
+                logger.LogWarning("[LEAGUES] Rejected: rootFolderId={Id} ({Path}) is not accessible", boundFolder.Id, boundFolder.Path);
+                return Results.BadRequest(new { error = $"Root folder {boundFolder.Path} is not accessible." });
+            }
+        }
+        else
+        {
+            if (allRootFolders.Count == 0)
+            {
+                logger.LogWarning("[LEAGUES] Rejected: no root folders configured");
+                return Results.BadRequest(new { error = "Configure a root folder under Settings > Media Management before adding a league." });
+            }
+            if (allRootFolders.Count == 1)
+            {
+                league.RootFolderId = allRootFolders[0].Id;
+                boundFolder = allRootFolders[0];
+                logger.LogInformation("[LEAGUES] No root folder selected, defaulting to single configured folder: {Id} ({Path})",
+                    allRootFolders[0].Id, allRootFolders[0].Path);
+            }
+            else
+            {
+                logger.LogInformation("[LEAGUES] No root folder selected and multiple configured — leaving RootFolderId null (legacy free-space fallback at import time)");
+            }
+        }
+
+        // Phase 4 cascade: if the league didn't request an explicit Quality
+        // Profile but its bound root folder has one pinned, copy it down so
+        // the new league inherits the root's pin. The user can still
+        // override per league afterwards via the Edit modal.
+        if (!league.QualityProfileId.HasValue && boundFolder?.DefaultQualityProfileId is int rootDefaultProfile)
+        {
+            league.QualityProfileId = rootDefaultProfile;
+            logger.LogInformation("[LEAGUES] Inherited default Quality Profile {ProfileId} from root folder {RootId}",
+                rootDefaultProfile, boundFolder.Id);
+        }
+
         // Added timestamp is already set in ToLeague()
         db.Leagues.Add(league);
         await db.SaveChangesAsync();
@@ -1263,9 +1335,16 @@ app.MapPost("/api/leagues", async (HttpContext context, SportarrDbContext db, IS
                 using var scope = scopeFactory.CreateScope();
                 var syncService = scope.ServiceProvider.GetRequiredService<LeagueEventSyncService>();
 
-                // fullHistoricalSync=true: Get ALL seasons so users have complete event history
-                // This only happens on initial league add - scheduled syncs use optimized mode
-                var syncResult = await syncService.SyncLeagueEventsAsync(leagueId, seasons: null, fullHistoricalSync: true);
+                // fullHistoricalSync=true: Get ALL seasons so users have complete event history.
+                // forceRefresh=true: this is a user-initiated league add — they expect the local DB
+                // to be current with TheSportsDB at the moment of add, not whatever the upstream
+                // cache happened to write last. Without forceRefresh, an add against a stale upstream
+                // cache plants stale events in the Sportarr DB and the very next click of the blue
+                // refresh button shows hundreds of "updated event" / "corrected episode number"
+                // entries — which surprises users who expect a fresh add to already be in sync.
+                // Background scheduled syncs (LeagueEventAutoSyncService) keep using the cheap
+                // cached path so the upstream API key budget isn't burned on routine work.
+                var syncResult = await syncService.SyncLeagueEventsAsync(leagueId, seasons: null, fullHistoricalSync: true, forceRefresh: true);
                 logger.LogInformation("[LEAGUES] Full historical sync completed for {Name}: {Message}",
                     leagueName, syncResult.Message);
             }
@@ -1667,8 +1746,11 @@ app.MapPost("/api/leagues/{id:int}/refresh-events", async (
             seasons = request?.Seasons;
         }
 
-        // Always do full historical sync to pick up any newly added seasons from API
-        var result = await syncService.SyncLeagueEventsAsync(id, seasons, fullHistoricalSync: true);
+        // User-initiated refresh: ask sportarr-api to bypass its own cache via
+        // Cache-Control: no-cache so we get the latest schedule from TheSportsDB
+        // in this request. fullHistoricalSync stays true so newly added seasons
+        // upstream are picked up immediately.
+        var result = await syncService.SyncLeagueEventsAsync(id, seasons, fullHistoricalSync: true, forceRefresh: true);
 
         if (!result.Success)
         {
@@ -1779,6 +1861,107 @@ app.MapPost("/api/leagues/{id:int}/recalculate-episodes", async (
     }
 });
 
+// PUT /api/leagues/{id}/move — change a league's RootFolderId binding,
+// optionally moving its on-disk media folder to the new root in the
+// process. The two flags map to the upstream Move Series feature: the
+// rootFolderId is the destination, moveFiles toggles whether files
+// follow (true) or stay where they are (false). Failures are surfaced
+// as the appropriate HTTP status code so the UI can show a useful
+// message rather than a generic 500.
+app.MapPut("/api/leagues/{id:int}/move", async (int id, MoveLeagueRequest request, LeagueMoveService moveService, ILogger<Program> logger) =>
+{
+    if (request == null)
+    {
+        return Results.BadRequest(new { error = "Request body is required" });
+    }
+    logger.LogInformation("[LEAGUES] PUT /api/leagues/{Id}/move - rootFolderId={RootId}, moveFiles={MoveFiles}",
+        id, request.RootFolderId, request.MoveFiles);
+
+    var result = await moveService.MoveLeagueAsync(id, request.RootFolderId, request.MoveFiles);
+    return MapMoveResultToHttp(result);
+});
+
+// POST /api/leagues/{id}/reorganize - consolidate a league's files
+// into a single root folder when MoveLeagueAsync rejected the move
+// with SourceFolderAmbiguous because files were scattered across
+// multiple roots. Each scattered file is moved to {targetRoot}/{its
+// relative path under the current root}; files already under the
+// target are left alone. The league's binding is updated on success
+// so a subsequent rename or move sees a clean state.
+app.MapPost("/api/leagues/{id:int}/reorganize", async (int id, ReorganizeLeagueRequest request, LeagueMoveService moveService, ILogger<Program> logger) =>
+{
+    if (request == null)
+    {
+        return Results.BadRequest(new { error = "Request body is required" });
+    }
+    logger.LogInformation("[LEAGUES] POST /api/leagues/{Id}/reorganize - rootFolderId={RootId}",
+        id, request.RootFolderId);
+
+    var result = await moveService.ReorganizeLeagueAsync(id, request.RootFolderId);
+    return MapMoveResultToHttp(result);
+});
+
+// POST /api/leagues/move/bulk — same operation across many leagues.
+// Each league is moved in its own DB transaction, so a failure on one
+// doesn't abort the others; the per-league results come back in the
+// response so the UI can surface the failures individually.
+app.MapPost("/api/leagues/move/bulk", async (BulkMoveLeaguesRequest request, LeagueMoveService moveService, ILogger<Program> logger) =>
+{
+    if (request == null || request.LeagueIds == null || request.LeagueIds.Count == 0)
+    {
+        return Results.BadRequest(new { error = "leagueIds must not be empty" });
+    }
+    logger.LogInformation("[LEAGUES] POST /api/leagues/move/bulk - {Count} leagues -> rootFolderId={RootId}, moveFiles={MoveFiles}",
+        request.LeagueIds.Count, request.RootFolderId, request.MoveFiles);
+
+    var results = await moveService.MoveLeaguesAsync(request.LeagueIds, request.RootFolderId, request.MoveFiles);
+    var anyFailed = results.Any(r => !r.Success);
+    return Results.Json(new
+    {
+        results = results.Select(r => new
+        {
+            leagueId = r.LeagueId,
+            success = r.Success,
+            status = r.Status.ToString(),
+            message = r.Message,
+            filesMoved = r.FilesMoved,
+            oldPath = r.OldPath,
+            newPath = r.NewPath,
+        }),
+        anyFailed,
+    }, statusCode: anyFailed ? 207 /* Multi-Status */ : 200);
+});
+
         return app;
+    }
+
+    /// <summary>Translate a LeagueMoveResult into the HTTP response shape.</summary>
+    private static IResult MapMoveResultToHttp(LeagueMoveResult result)
+    {
+        return result.Status switch
+        {
+            LeagueMoveStatus.Ok => Results.Ok(new
+            {
+                leagueId = result.LeagueId,
+                rootFolderId = result.NewRootFolderId,
+                filesMoved = result.FilesMoved,
+                oldPath = result.OldPath,
+                newPath = result.NewPath,
+                message = result.Message,
+            }),
+            LeagueMoveStatus.SameRootFolder => Results.Ok(new
+            {
+                leagueId = result.LeagueId,
+                rootFolderId = result.NewRootFolderId,
+                message = "League is already bound to that root folder; nothing to do.",
+            }),
+            LeagueMoveStatus.LeagueNotFound => Results.NotFound(new { error = $"League {result.LeagueId} not found" }),
+            LeagueMoveStatus.RootFolderNotFound => Results.BadRequest(new { error = $"Root folder {result.NewRootFolderId} does not exist." }),
+            LeagueMoveStatus.RootFolderInaccessible => Results.BadRequest(new { error = $"Root folder is not accessible: {result.Message}" }),
+            LeagueMoveStatus.SourceFolderAmbiguous => Results.BadRequest(new { error = result.Message ?? "Could not resolve the league's current on-disk folder." }),
+            LeagueMoveStatus.DestinationExists => Results.Conflict(new { error = result.Message ?? "Destination already exists." }),
+            LeagueMoveStatus.MoveFailed => Results.Problem(detail: result.Message, statusCode: 500, title: "League move failed"),
+            _ => Results.Problem(detail: "Unknown move status", statusCode: 500),
+        };
     }
 }

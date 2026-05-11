@@ -559,16 +559,23 @@ public static class QualityParser
     }
 
     /// <summary>
-    /// Parse quality from file extension
+    /// Parse quality from file extension. Sonarr-parity fallback for filenames
+    /// that have no resolution/source tokens but whose container hints at the
+    /// source. Conservative: only sets a quality when the extension is a strong
+    /// signal on its own.
     /// </summary>
-    private static QualityDefinition ParseQualityFromExtension(string extension)
+    public static QualityDefinition ParseQualityFromExtension(string extension)
     {
         extension = extension.ToLowerInvariant().TrimStart('.');
 
         return extension switch
         {
-            "ts" => Quality.RAWHD,
-            "avi" or "wmv" or "flv" => Quality.SDTV,
+            // Transport stream — broadcast/IPTV captures, treated as RAWHD by Sonarr
+            "ts" or "m2ts" or "mts" => Quality.RAWHD,
+            // Disc images — almost always BluRay 1080p; safer default than guessing 2160p
+            "iso" or "bdmv" or "img" => Quality.Bluray1080p,
+            // Legacy SD containers
+            "avi" or "wmv" or "flv" or "mpg" or "mpeg" or "vob" => Quality.SDTV,
             _ => Quality.Unknown
         };
     }

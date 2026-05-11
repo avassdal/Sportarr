@@ -11,6 +11,8 @@ jobs:
     permissions:
       contents: write
       packages: write
+    outputs:
+      version: ${{ steps.version.outputs.version }}
 
     steps:
       - name: Checkout code
@@ -61,6 +63,23 @@ jobs:
           dotnet publish src/Sportarr.csproj -c Release -r win-x64 --self-contained true -p:PublishSingleFile=true -p:SkipFrontendBuild=true -p:Version=${{ steps.version.outputs.version }} -o publish/win-x64
           cd publish/win-x64 && zip -r ../../Sportarr-win-x64-${{ steps.version.outputs.version }}.zip .
 
+      - name: Upload Windows build for installer
+        uses: actions/upload-artifact@v4
+        with:
+          name: win-x64-build
+          path: publish/win-x64/
+          retention-days: 1
+
+      - name: Upload installer assets
+        uses: actions/upload-artifact@v4
+        with:
+          name: installer-assets
+          path: |
+            installer/
+            Logo/
+            COPYRIGHT.md
+          retention-days: 1
+
       - name: Build Linux x64
         run: |
           dotnet publish src/Sportarr.csproj -c Release -r linux-x64 --self-contained true -p:PublishSingleFile=true -p:SkipFrontendBuild=true -p:Version=${{ steps.version.outputs.version }} -o publish/linux-x64
@@ -81,6 +100,19 @@ jobs:
           dotnet publish src/Sportarr.csproj -c Release -r osx-arm64 --self-contained true -p:PublishSingleFile=true -p:SkipFrontendBuild=true -p:Version=${{ steps.version.outputs.version }} -o publish/osx-arm64
           cd publish/osx-arm64 && tar -czvf ../../Sportarr-osx-arm64-${{ steps.version.outputs.version }}.tar.gz .
 
+      # GitHub caps a single release at 1000 assets. The dev "Development
+      # Build" release is auto-overwritten on every push, so over time we
+      # accumulate artifact uploads until softprops/action-gh-release fails
+      # with `file_count limited to 1000 assets per release`. Delete the
+      # release (keep the tag — softprops will reattach it) before each push
+      # so the asset count starts back at zero. continue-on-error so a
+      # first-time run with no existing release doesn't fail the workflow.
+      - name: Clear stale dev-release assets
+        run: gh release delete dev --yes --repo "${{ github.repository }}" || true
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        continue-on-error: true
+
       - name: Update dev prerelease
         uses: softprops/action-gh-release@v2
         with:
@@ -99,7 +131,8 @@ jobs:
             ```
 
             ### Downloads
-            - **Windows x64**: Sportarr-win-x64-${{ steps.version.outputs.version }}.zip
+            - **Windows Installer (recommended)**: Sportarr-Setup-${{ steps.version.outputs.version }}.exe
+            - **Windows x64 (portable)**: Sportarr-win-x64-${{ steps.version.outputs.version }}.zip
             - **Linux x64**: Sportarr-linux-x64-${{ steps.version.outputs.version }}.tar.gz
             - **Linux ARM64**: Sportarr-linux-arm64-${{ steps.version.outputs.version }}.tar.gz
             - **macOS x64**: Sportarr-osx-x64-${{ steps.version.outputs.version }}.tar.gz
@@ -179,3 +212,76 @@ jobs:
                 \"timestamp\": \"$(date -u +%Y-%m-%dT%H:%M:%S.000Z)\"
               }]
             }"
+
+  # Windows Installer Job - builds .exe installer using Inno Setup so dev
+  # users get the same one-click update experience as stable. Runs after
+  # build-dev so the dev release already exists; this job appends the .exe
+  # to it. ISCC's VersionInfoVersion field rejects the -dev suffix, so the
+  # version is stripped for compilation and the output file is renamed
+  # back to include -dev for the download artifact.
+  build-windows-installer:
+    needs: build-dev
+    runs-on: windows-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download Windows build
+        uses: actions/download-artifact@v4
+        with:
+          name: win-x64-build
+          path: publish/win-x64
+
+      - name: Download installer assets
+        uses: actions/download-artifact@v4
+        with:
+          name: installer-assets
+          path: .
+
+      - name: Create ICO file from PNG
+        shell: pwsh
+        run: |
+          choco install imagemagick -y --no-progress
+          refreshenv
+
+          $env:Path = "C:\Program Files\ImageMagick-7.1.1-Q16-HDRI;$env:Path"
+          magick Logo/256.png Logo/128.png Logo/64.png Logo/48.png Logo/32.png Logo/16.png Logo/sportarr.ico
+
+          Write-Host "Created sportarr.ico"
+          Get-Item Logo/sportarr.ico
+
+      - name: Install Inno Setup
+        shell: pwsh
+        run: |
+          choco install innosetup -y --no-progress
+          Write-Host "Inno Setup installed"
+
+      - name: Build Windows Installer
+        shell: pwsh
+        run: |
+          $devVersion = "${{ needs.build-dev.outputs.version }}"
+          # Strip -dev suffix: ISCC's VersionInfoVersion requires a numeric
+          # x.x.x.x format and rejects pre-release suffixes.
+          $numericVersion = $devVersion -replace '-dev$', ''
+          Write-Host "Dev version: $devVersion"
+          Write-Host "Numeric version for ISCC: $numericVersion"
+
+          New-Item -ItemType Directory -Force -Path installer-output
+
+          & "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" /DMyAppVersion=$numericVersion installer/sportarr.iss
+
+          # Rename so the dev installer is clearly distinguishable from stable.
+          Move-Item "installer-output/Sportarr-Setup-$numericVersion.exe" "installer-output/Sportarr-Setup-$devVersion.exe"
+
+          Write-Host "Installer built successfully"
+          Get-ChildItem installer-output/
+
+      - name: Upload installer to dev release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: dev
+          prerelease: true
+          files: |
+            installer-output/Sportarr-Setup-${{ needs.build-dev.outputs.version }}.exe
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

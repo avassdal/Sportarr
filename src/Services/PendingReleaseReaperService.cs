@@ -69,6 +69,7 @@ public class PendingReleaseReaperService : BackgroundService
         var ready = await db.PendingReleases
             .Include(p => p.Event)
                 .ThenInclude(e => e!.League)
+                .ThenInclude(l => l!.RootFolder)
             .Where(p => p.Status == PendingReleaseStatus.Pending && p.ReleasableAt <= now)
             .ToListAsync(cancellationToken);
 
@@ -167,10 +168,15 @@ public class PendingReleaseReaperService : BackgroundService
         var indexerRecord = await db.Indexers
             .FirstOrDefaultAsync(i => i.Name == pending.Indexer, cancellationToken);
 
+        // Per-root override beats the download client's default category.
+        var reaperGrabCategory = !string.IsNullOrWhiteSpace(evt.League?.RootFolder?.DefaultDownloadClientCategory)
+            ? evt.League.RootFolder.DefaultDownloadClientCategory!
+            : downloadClient.Category;
+
         var downloadId = await downloadClientService.AddDownloadAsync(
             downloadClient,
             pending.DownloadUrl,
-            downloadClient.Category,
+            reaperGrabCategory,
             pending.Title,
             indexerRecord?.SeedRatio,
             indexerRecord?.SeedTime);

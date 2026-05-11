@@ -1,10 +1,12 @@
 import { Fragment, useState, useEffect } from 'react';
 import { Dialog, Transition } from '@headlessui/react';
-import { XMarkIcon, TrashIcon, FolderIcon, FilmIcon, ChevronDownIcon, ChevronRightIcon, ArrowPathIcon, ArrowsRightLeftIcon } from '@heroicons/react/24/outline';
+import { XMarkIcon, TrashIcon, FolderIcon, FilmIcon, ChevronDownIcon, ChevronRightIcon, ArrowPathIcon, ArrowsRightLeftIcon, PencilIcon } from '@heroicons/react/24/outline';
 import ReassignEventFileModal from './ReassignEventFileModal';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import apiClient from '../api/client';
 import { toast } from 'sonner';
+import FileMetadataEditModal from './FileMetadataEditModal';
+import type { FileMetadataEditorValues } from './FileMetadataEditor';
 
 interface RenamePreviewItem {
   leagueId: number;
@@ -28,6 +30,12 @@ interface LeagueFile {
   quality?: string;
   qualityScore?: number;
   customFormatScore?: number;
+  codec?: string;
+  source?: string;
+  releaseGroup?: string;
+  originalTitle?: string;
+  languages?: string[];
+  indexerFlags?: string;
   partName?: string;
   partNumber?: number;
   added: string;
@@ -81,6 +89,31 @@ export default function LeagueFilesModal({
   const [deletedFileIds, setDeletedFileIds] = useState<Set<number>>(new Set());
   // Reassign-to-different-event modal state (per-file action)
   const [reassignFile, setReassignFile] = useState<LeagueFile | null>(null);
+
+  // Metadata editor state — single (file != null) or bulk (selectedIds non-empty)
+  const [editFile, setEditFile] = useState<LeagueFile | null>(null);
+  const [selectedIds, setSelectedIds] = useState<Set<number>>(new Set());
+  const [bulkEditOpen, setBulkEditOpen] = useState(false);
+  const toggleSelected = (id: number) => {
+    setSelectedIds((prev) => {
+      const n = new Set(prev);
+      if (n.has(id)) n.delete(id); else n.add(id);
+      return n;
+    });
+  };
+  const clearSelected = () => setSelectedIds(new Set());
+
+  const fileToEditorValues = (f: LeagueFile): FileMetadataEditorValues => ({
+    quality: f.quality,
+    source: f.source,
+    codec: f.codec,
+    releaseGroup: f.releaseGroup,
+    originalTitle: f.originalTitle,
+    languages: f.languages ?? [],
+    indexerFlags: f.indexerFlags,
+    partName: f.partName,
+    partNumber: f.partNumber ?? null,
+  });
 
   // Rename functionality state
   const [showRenamePreview, setShowRenamePreview] = useState(false);
@@ -265,9 +298,9 @@ export default function LeagueFilesModal({
             >
               <Dialog.Panel className="w-full max-w-4xl transform overflow-hidden rounded-lg bg-gray-900 text-left align-middle shadow-xl transition-all border border-gray-700">
                 {/* Header */}
-                <div className="flex items-center justify-between p-4 border-b border-gray-700">
-                  <div>
-                    <Dialog.Title className="text-lg font-medium text-white">
+                <div className="flex items-center justify-between p-4 border-b border-gray-700 gap-3">
+                  <div className="min-w-0 flex-1">
+                    <Dialog.Title className="text-lg font-medium text-white truncate">
                       {title}
                     </Dialog.Title>
                     {data && (
@@ -276,9 +309,45 @@ export default function LeagueFilesModal({
                       </p>
                     )}
                   </div>
+                  <div className="flex items-center gap-2 flex-wrap">
+                    {displayFiles.length > 0 && (
+                      <button
+                        onClick={() => {
+                          const all = new Set(displayFiles.map((f) => f.id));
+                          const allSelected = displayFiles.every((f) => selectedIds.has(f.id));
+                          setSelectedIds(allSelected ? new Set() : all);
+                        }}
+                        className="px-3 py-1.5 bg-gray-700 hover:bg-gray-600 text-white text-sm rounded-lg transition-colors"
+                      >
+                        {displayFiles.length > 0 && displayFiles.every((f) => selectedIds.has(f.id))
+                          ? 'Deselect All'
+                          : 'Select All'}
+                      </button>
+                    )}
+                    {selectedIds.size > 0 && (
+                      <>
+                        <span className="text-xs text-gray-300 hidden md:inline">
+                          {selectedIds.size} selected
+                        </span>
+                        <button
+                          onClick={() => setBulkEditOpen(true)}
+                          className="px-3 py-1.5 bg-blue-700 hover:bg-blue-600 text-white text-sm font-medium rounded-lg transition-colors flex items-center gap-1.5"
+                        >
+                          <PencilIcon className="w-4 h-4" />
+                          Edit Selected
+                        </button>
+                        <button
+                          onClick={clearSelected}
+                          className="px-2 py-1 text-xs text-gray-300 hover:text-white"
+                        >
+                          Clear
+                        </button>
+                      </>
+                    )}
+                  </div>
                   <button
                     onClick={onClose}
-                    className="text-gray-400 hover:text-white transition-colors"
+                    className="text-gray-400 hover:text-white transition-colors flex-shrink-0"
                   >
                     <XMarkIcon className="w-6 h-6" />
                   </button>
@@ -356,6 +425,9 @@ export default function LeagueFilesModal({
                           file={file}
                           onDelete={() => deleteFileMutation.mutate({ eventId: file.eventId, fileId: file.id })}
                           onReassign={() => setReassignFile(file)}
+                          onEdit={() => setEditFile(file)}
+                          isSelected={selectedIds.has(file.id)}
+                          onToggleSelect={() => toggleSelected(file.id)}
                           isDeleting={deleteFileMutation.isPending}
                           showEventInfo
                         />
@@ -397,6 +469,9 @@ export default function LeagueFilesModal({
                                     file={file}
                                     onDelete={() => deleteFileMutation.mutate({ eventId: file.eventId, fileId: file.id })}
                                     onReassign={() => setReassignFile(file)}
+                                    onEdit={() => setEditFile(file)}
+                                    isSelected={selectedIds.has(file.id)}
+                                    onToggleSelect={() => toggleSelected(file.id)}
                                     isDeleting={deleteFileMutation.isPending}
                                     showEventInfo
                                   />
@@ -492,6 +567,40 @@ export default function LeagueFilesModal({
         }}
       />
     )}
+
+    {/* Per-row metadata editor */}
+    {editFile && (
+      <FileMetadataEditModal
+        key={`league-edit-${editFile.id}`}
+        isOpen={!!editFile}
+        onClose={() => setEditFile(null)}
+        fileIds={[editFile.id]}
+        initialValues={fileToEditorValues(editFile)}
+        showPartFields={true}
+        leagueId={leagueId}
+        eventId={editFile.eventId}
+        onSaved={async () => {
+          await queryClient.refetchQueries({ queryKey: ['league-files', leagueId] });
+        }}
+      />
+    )}
+
+    {/* Bulk metadata editor (multi-select) */}
+    {bulkEditOpen && selectedIds.size > 0 && (
+      <FileMetadataEditModal
+        key={`league-bulk-${[...selectedIds].sort().join('-')}`}
+        isOpen={bulkEditOpen}
+        onClose={() => setBulkEditOpen(false)}
+        fileIds={[...selectedIds]}
+        initialValues={{}}
+        showPartFields={true}
+        leagueId={leagueId}
+        onSaved={async () => {
+          clearSelected();
+          await queryClient.refetchQueries({ queryKey: ['league-files', leagueId] });
+        }}
+      />
+    )}
     </>
   );
 }
@@ -503,16 +612,34 @@ function FileRow({
   onReassign,
   isDeleting,
   showEventInfo,
+  isSelected,
+  onToggleSelect,
+  onEdit,
 }: {
   file: LeagueFile;
   onDelete: () => void;
   onReassign: () => void;
   isDeleting: boolean;
   showEventInfo?: boolean;
+  isSelected?: boolean;
+  onToggleSelect?: () => void;
+  onEdit?: () => void;
 }) {
   return (
-    <div className="bg-gray-800 rounded-lg p-3 border border-gray-700">
+    <div className={
+      'rounded-lg p-3 border transition-colors ' +
+      (isSelected ? 'bg-blue-950/40 border-blue-600' : 'bg-gray-800 border-gray-700')
+    }>
       <div className="flex items-start justify-between gap-4">
+        {onToggleSelect && (
+          <input
+            type="checkbox"
+            checked={!!isSelected}
+            onChange={onToggleSelect}
+            className="mt-1 accent-blue-600 cursor-pointer"
+            title="Select for bulk edit"
+          />
+        )}
         <div className="flex-1 min-w-0">
           {/* Event Info */}
           {showEventInfo && (
@@ -543,6 +670,11 @@ function FileRow({
                 {file.quality}
               </span>
             )}
+            {file.releaseGroup && (
+              <span className="px-1.5 py-0.5 bg-gray-700 text-gray-300 rounded">
+                {file.releaseGroup}
+              </span>
+            )}
             {file.customFormatScore !== undefined && file.customFormatScore !== 0 && (
               <span className="px-1.5 py-0.5 bg-purple-600/20 text-purple-400 rounded" title="Custom Format Score - Higher is better">
                 CF Score: {file.customFormatScore}
@@ -552,6 +684,18 @@ function FileRow({
         </div>
 
         <div className="flex items-center gap-1 flex-shrink-0">
+          {/* Edit Metadata Button */}
+          {onEdit && (
+            <button
+              onClick={onEdit}
+              disabled={isDeleting}
+              className="p-2 text-gray-400 hover:text-emerald-400 hover:bg-emerald-600/10 rounded transition-colors disabled:opacity-50"
+              title="Edit file metadata (Quality, ReleaseGroup, Languages…)"
+            >
+              <PencilIcon className="w-5 h-5" />
+            </button>
+          )}
+
           {/* Reassign Button - move a mismatched file to a different event */}
           <button
             onClick={onReassign}

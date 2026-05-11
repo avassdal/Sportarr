@@ -1,5 +1,6 @@
 using System.Text.Json.Serialization;
 using Sportarr.Api.Converters;
+using Sportarr.Api.Helpers;
 using Sportarr.Api.Services;
 
 namespace Sportarr.Api.Models;
@@ -192,15 +193,34 @@ public class Event
     public DateTime DateEventFallback { get; set; }
 
     /// <summary>
-    /// Broadcast-local date (no time component) as published by the source API.
-    /// CRITICAL for query building: indexer releases name shows by their local
-    /// broadcast date, not by UTC. AEW Dynamite "Dec 31, 2025 8pm Eastern" is
-    /// EventDate=2026-01-01T01:00Z but BroadcastDate=2025-12-31, so queries
-    /// must use BroadcastDate to find "AEW.2025.12.31.*" releases.
-    /// Null for events synced before this field was added; falls back to
-    /// EventDate.Date (UTC-based, the old behavior).
+    /// Broadcast-local date (no time component) as published by the
+    /// upstream API. The API resolves this from the league's IANA
+    /// broadcast timezone, so AEW Dynamite "Dec 31, 2025 8pm Eastern"
+    /// arrives as BroadcastDate=2025-12-31 even though
+    /// EventDate=2026-01-01T01:00Z. CRITICAL for filenames, indexer
+    /// queries, and Plex originallyAvailableAt: scene release groups
+    /// and broadcasters all key off this date, not UTC.
+    /// API binding: prefers the new "broadcastDate" field (TZ-anchored)
+    /// the upstream service computes per league. ApplyBroadcastDateFallback
+    /// fills it from EventDate.Date (UTC) when the upstream response
+    /// is older / pre-rollout — this fallback drifts a day for
+    /// late-Eastern events but matches the previous behavior.
     /// </summary>
+    [JsonPropertyName("broadcastDate")]
+    [JsonConverter(typeof(NullableEventDateConverter))]
     public DateTime? BroadcastDate { get; set; }
+
+    /// <summary>
+    /// IANA broadcast timezone (e.g. "America/New_York") resolved by
+    /// the upstream API from the league name. Used for UI display
+    /// ("airs 8pm America/New_York") and to render scheduled times in
+    /// the broadcaster's local clock. Null for events whose league
+    /// has no known TZ mapping; UI should fall back to UTC display.
+    /// Not persisted — purely transient on API responses.
+    /// </summary>
+    [JsonPropertyName("broadcastTimezone")]
+    [System.ComponentModel.DataAnnotations.Schema.NotMapped]
+    public string? BroadcastTimezone { get; set; }
 
     [JsonPropertyName("strVenue")]
     public string? Venue { get; set; }
@@ -233,26 +253,50 @@ public class Event
     /// <summary>
     /// Event poster image URL from Sportarr API API (not stored in DB, used during deserialization)
     /// </summary>
+    // Image URLs go through ImageUrlNormalizer so legacy
+    // www.thesportsdb.com URLs get rewritten to r2.thesportsdb.com
+    // on assignment. See League.LogoUrl for the rationale.
+
     [JsonPropertyName("strPoster")]
-    public string? PosterUrl { get; set; }
+    public string? PosterUrl
+    {
+        get => _posterUrl;
+        set => _posterUrl = ImageUrlNormalizer.Normalize(value);
+    }
+    private string? _posterUrl;
 
     /// <summary>
     /// Event thumbnail image URL from Sportarr API API (not stored in DB, used during deserialization)
     /// </summary>
     [JsonPropertyName("strThumb")]
-    public string? ThumbUrl { get; set; }
+    public string? ThumbUrl
+    {
+        get => _thumbUrl;
+        set => _thumbUrl = ImageUrlNormalizer.Normalize(value);
+    }
+    private string? _thumbUrl;
 
     /// <summary>
     /// Event banner image URL from Sportarr API API (not stored in DB, used during deserialization)
     /// </summary>
     [JsonPropertyName("strBanner")]
-    public string? BannerUrl { get; set; }
+    public string? BannerUrl
+    {
+        get => _bannerUrl;
+        set => _bannerUrl = ImageUrlNormalizer.Normalize(value);
+    }
+    private string? _bannerUrl;
 
     /// <summary>
     /// Event fanart image URL from Sportarr API API (not stored in DB, used during deserialization)
     /// </summary>
     [JsonPropertyName("strFanart")]
-    public string? FanartUrl { get; set; }
+    public string? FanartUrl
+    {
+        get => _fanartUrl;
+        set => _fanartUrl = ImageUrlNormalizer.Normalize(value);
+    }
+    private string? _fanartUrl;
 
     public DateTime Added { get; set; } = DateTime.UtcNow;
     public DateTime? LastUpdate { get; set; }
@@ -365,6 +409,17 @@ public class EventFile
     public bool Exists { get; set; } = true;
 
     /// <summary>
+    /// Timestamp the file first went missing (Exists transitioned true to false).
+    /// Cleared when the file is found again. The disk scanner uses this with
+    /// Config.EventFileMissingDeleteAfterDays as a grace period before hard-
+    /// deleting the row. Protects against transient unreachability — backup
+    /// restored to a new server, NAS reconnects, container restart racing the
+    /// network mount, etc. — without permanently leaking rows for files the
+    /// user has actually deleted.
+    /// </summary>
+    public DateTime? MissingSince { get; set; }
+
+    /// <summary>
     /// Original release title from the indexer (the grabbed filename before renaming)
     /// Useful for verifying correct content was downloaded (e.g., checking "Prelims" vs "Main Card")
     /// </summary>
@@ -375,6 +430,19 @@ public class EventFile
     /// Used for file renaming with {Release Group} token
     /// </summary>
     public string? ReleaseGroup { get; set; }
+
+    /// <summary>
+    /// Audio/subtitle languages present in the file (e.g., ["English", "Spanish"]).
+    /// Stored as a JSON array. User-editable via the file metadata editor.
+    /// </summary>
+    public List<string> Languages { get; set; } = new();
+
+    /// <summary>
+    /// Indexer-side flags from the original release (e.g., "Freeleech", "Internal", "Scene", "Nuked").
+    /// Stored as a comma-separated token list. Sourced from the indexer at grab time
+    /// where available, user-editable via the file metadata editor afterward.
+    /// </summary>
+    public string? IndexerFlags { get; set; }
 }
 
 /// <summary>
@@ -399,6 +467,20 @@ public class EventResponse
     public int? EpisodeNumber { get; set; }
     public string? Round { get; set; }
     public DateTime EventDate { get; set; }
+    /// <summary>
+    /// Broadcast-local date the event is branded by (e.g. "Monday Night
+    /// Raw 2026-05-04" stays Monday even though the UTC instant rolls
+    /// into Tuesday). Use this for filename-style display and "what date
+    /// is this on the broadcaster's calendar" UI; EventDate stays as the
+    /// canonical UTC instant for ordering and live status.
+    /// </summary>
+    public DateTime? BroadcastDate { get; set; }
+    /// <summary>
+    /// IANA broadcast timezone (e.g. "America/New_York"). UI may use it
+    /// to localize EventDate for display. Null when the upstream API
+    /// has no league mapping.
+    /// </summary>
+    public string? BroadcastTimezone { get; set; }
     public string? Venue { get; set; }
     public string? Location { get; set; }
     public string? Broadcast { get; set; }
@@ -454,6 +536,8 @@ public class EventResponse
             EpisodeNumber = evt.EpisodeNumber,
             Round = evt.Round,
             EventDate = evt.EventDate,
+            BroadcastDate = evt.BroadcastDate,
+            BroadcastTimezone = evt.BroadcastTimezone,
             Venue = evt.Venue,
             Location = evt.Location,
             Broadcast = evt.Broadcast,
@@ -566,6 +650,7 @@ public class EventResponse
 public class EventFileResponse
 {
     public int Id { get; set; }
+    public int EventId { get; set; }
     public string FilePath { get; set; } = string.Empty;
     public long Size { get; set; }
     public string? Quality { get; set; }
@@ -574,9 +659,13 @@ public class EventFileResponse
     public string? Codec { get; set; }
     public string? Source { get; set; }
     public string? ReleaseGroup { get; set; }
+    public string? OriginalTitle { get; set; }
+    public List<string> Languages { get; set; } = new();
+    public string? IndexerFlags { get; set; }
     public string? PartName { get; set; }
     public int? PartNumber { get; set; }
     public DateTime Added { get; set; }
+    public DateTime? LastVerified { get; set; }
     public bool Exists { get; set; }
 
     public static EventFileResponse FromEventFile(EventFile file)
@@ -584,6 +673,7 @@ public class EventFileResponse
         return new EventFileResponse
         {
             Id = file.Id,
+            EventId = file.EventId,
             FilePath = file.FilePath,
             Size = file.Size,
             Quality = file.Quality,
@@ -592,9 +682,13 @@ public class EventFileResponse
             Codec = file.Codec,
             Source = file.Source,
             ReleaseGroup = file.ReleaseGroup,
+            OriginalTitle = file.OriginalTitle,
+            Languages = file.Languages ?? new List<string>(),
+            IndexerFlags = file.IndexerFlags,
             PartName = file.PartName,
             PartNumber = file.PartNumber,
             Added = file.Added,
+            LastVerified = file.LastVerified,
             Exists = file.Exists
         };
     }

@@ -33,6 +33,16 @@ interface QualityProfile {
   name: string;
 }
 
+interface RootFolder {
+  id: number;
+  path: string;
+  accessible: boolean;
+  freeSpace: number;
+  totalSpace: number;
+  defaultQualityProfileId?: number | null;
+  defaultDownloadClientCategory?: string | null;
+}
+
 interface AddLeagueModalProps {
   league: League | null;
   isOpen: boolean;
@@ -49,7 +59,8 @@ interface AddLeagueModalProps {
     monitoredSessionTypes: string | null,
     monitoredEventTypes: string | null,
     searchQueryTemplate: string | null,
-    tags: number[]
+    tags: number[],
+    rootFolderId: number | null
   ) => void;
   isAdding: boolean;
   editMode?: boolean;
@@ -149,6 +160,7 @@ export default function AddLeagueModal({ league, isOpen, onClose, onAdd, isAddin
   const [selectAll, setSelectAll] = useState(false);
   const [monitorType, setMonitorType] = useState('All');
   const [qualityProfileId, setQualityProfileId] = useState<number | null>(null);
+  const [rootFolderId, setRootFolderId] = useState<number | null>(null);
   const [searchForMissingEvents, setSearchForMissingEvents] = useState(false);
   const [searchForCutoffUnmetEvents, setSearchForCutoffUnmetEvents] = useState(false);
   // For fighting sports: default to all parts selected
@@ -206,6 +218,20 @@ export default function AddLeagueModal({ league, isOpen, onClose, onAdd, isAddin
       return response.json() as Promise<QualityProfile[]>;
     },
     staleTime: 5 * 60 * 1000,
+  });
+
+  // Fetch root folders. Used to populate the Root Folder dropdown so the
+  // user picks where this league's media will live up front rather than
+  // letting the importer pick "the disk with the most free space" on each
+  // event (which scattered a single league across roots).
+  const { data: rootFolders = [] } = useQuery({
+    queryKey: ['root-folders'],
+    queryFn: async () => {
+      const response = await apiGet('/api/rootfolder');
+      if (!response.ok) throw new Error('Failed to fetch root folders');
+      return response.json() as Promise<RootFolder[]>;
+    },
+    staleTime: 60 * 1000,
   });
 
   // Fetch config to check if multi-part episodes are enabled
@@ -329,6 +355,7 @@ export default function AddLeagueModal({ league, isOpen, onClose, onAdd, isAddin
 
       setMonitorType(existingLeague.monitorType || 'All');
       setQualityProfileId(existingLeague.qualityProfileId || null);
+      setRootFolderId(existingLeague.rootFolderId ?? null);
       setSearchForMissingEvents(existingLeague.searchForMissingEvents || false);
       setSearchForCutoffUnmetEvents(existingLeague.searchForCutoffUnmetEvents || false);
       setSearchQueryTemplate(existingLeague.searchQueryTemplate || '');
@@ -420,6 +447,12 @@ export default function AddLeagueModal({ league, isOpen, onClose, onAdd, isAddin
       setSearchQuery('');
       setMonitorType('Future');
       setQualityProfileId(qualityProfiles.length > 0 ? qualityProfiles[0].id : null);
+      // Default to the most-free-space accessible root folder so single-root
+      // setups don't require a click and multi-root setups still surface a
+      // sensible pre-selection.
+      const accessibleRoots = rootFolders.filter(rf => rf.accessible);
+      const bestRoot = accessibleRoots.slice().sort((a, b) => b.freeSpace - a.freeSpace)[0];
+      setRootFolderId(bestRoot ? bestRoot.id : null);
       setSearchForMissingEvents(false);
       setSearchForCutoffUnmetEvents(false);
       setSearchQueryTemplate('');
@@ -455,7 +488,7 @@ export default function AddLeagueModal({ league, isOpen, onClose, onAdd, isAddin
         setSelectAllEventTypes(false);
       }
     }
-  }, [league?.idLeague, league?.strSport, league?.strLeague, editMode, isOpen, qualityProfiles, availableSessionTypes, availableEventTypes]);
+  }, [league?.idLeague, league?.strSport, league?.strLeague, editMode, isOpen, qualityProfiles, rootFolders, availableSessionTypes, availableEventTypes]);
 
   // Clear initialization tracking when modal closes
   useEffect(() => {
@@ -621,7 +654,8 @@ export default function AddLeagueModal({ league, isOpen, onClose, onAdd, isAddin
       sessionTypesString,
       eventTypesString,
       searchQueryTemplate.trim() || null,
-      selectedTags
+      selectedTags,
+      rootFolderId
     );
   };
 
@@ -1049,6 +1083,70 @@ export default function AddLeagueModal({ league, isOpen, onClose, onAdd, isAddin
                         Select which parts of fight cards to monitor. Unselected parts will not be searched.
                         {editMode && ' Changes will apply to all existing events in this league.'}
                       </p>
+                    </div>
+                  )}
+
+                  {/* Root Folder — surfaced only on add. Editing the root
+                      after add is a destructive operation (it'd require
+                      moving files), which is tracked separately under the
+                      "move league" workflow and isn't wired up here yet. */}
+                  {!editMode && (
+                    <div className="mb-4">
+                      <label className="block text-sm font-medium text-gray-300 mb-2">
+                        Root Folder
+                      </label>
+                      {rootFolders.length === 0 ? (
+                        <div className="px-3 py-2 bg-black border border-yellow-700/50 rounded-lg text-yellow-300 text-sm">
+                          No root folders configured. Add one under Settings &rarr; Media Management before adding leagues.
+                        </div>
+                      ) : (
+                        <>
+                          <select
+                            value={rootFolderId ?? ''}
+                            onChange={(e) => {
+                              const newRootId = e.target.value ? parseInt(e.target.value) : null;
+                              setRootFolderId(newRootId);
+                              // Cascade per-root defaults (Phase 4): if the
+                              // selected root has a pinned Quality Profile,
+                              // adopt it. The user can still override
+                              // manually after — we only auto-apply when
+                              // the root actually has a default to give.
+                              if (newRootId != null) {
+                                const picked = rootFolders.find(rf => rf.id === newRootId);
+                                if (picked?.defaultQualityProfileId != null) {
+                                  setQualityProfileId(picked.defaultQualityProfileId);
+                                }
+                              }
+                            }}
+                            className="w-full px-3 py-2 bg-black border border-red-900/30 rounded-lg text-white focus:outline-none focus:border-red-600 focus:ring-1 focus:ring-red-600"
+                          >
+                            {rootFolders.map(rf => {
+                              const freeGiB = rf.freeSpace > 0 ? (rf.freeSpace / (1024 ** 3)).toFixed(1) : '?';
+                              const status = rf.accessible ? '' : ' (inaccessible)';
+                              return (
+                                <option key={rf.id} value={rf.id} disabled={!rf.accessible}>
+                                  {rf.path} — {freeGiB} GiB free{status}
+                                </option>
+                              );
+                            })}
+                          </select>
+                          <p className="text-xs text-gray-400 mt-2">
+                            All events for this league will be imported under this folder.
+                            {(() => {
+                              const r = rootFolders.find(rf => rf.id === rootFolderId);
+                              const hints: string[] = [];
+                              if (r?.defaultQualityProfileId != null) {
+                                const p = qualityProfiles.find(qp => qp.id === r.defaultQualityProfileId);
+                                if (p) hints.push(`default profile: ${p.name}`);
+                              }
+                              if (r?.defaultDownloadClientCategory) {
+                                hints.push(`download category: ${r.defaultDownloadClientCategory}`);
+                              }
+                              return hints.length > 0 ? ` (${hints.join(' · ')})` : '';
+                            })()}
+                          </p>
+                        </>
+                      )}
                     </div>
                   )}
 

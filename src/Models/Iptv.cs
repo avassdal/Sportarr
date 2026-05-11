@@ -423,6 +423,25 @@ public class IptvChannel
     public string? DetectedNetwork { get; set; }
 
     /// <summary>
+    /// Canonical iptv-org channel id (format "Name.cc", e.g.
+    /// "ESPN.us", "SkySportsMainEvent.uk"). Populated by the
+    /// IptvOrgSyncService when it can match this channel against the
+    /// public iptv-org/database. Stable across provider rebrands so
+    /// it makes a reliable join key for EPG, logo, and country
+    /// lookups even when the user's M3U omits tvg-id entirely.
+    /// </summary>
+    public string? IptvOrgId { get; set; }
+
+    /// <summary>
+    /// Confidence (0-100) that IptvOrgId is the right canonical
+    /// match for this channel, as scored by the multi-tier matcher.
+    /// Useful for UI hints ("This match is 70% confident; click to
+    /// override") and for downstream consumers that want to gate on
+    /// a high-confidence match before relying on the canonical id.
+    /// </summary>
+    public int? IptvOrgConfidence { get; set; }
+
+    /// <summary>
     /// Navigation property for league mappings
     /// </summary>
     public List<ChannelLeagueMapping> LeagueMappings { get; set; } = new();

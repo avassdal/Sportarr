@@ -111,6 +111,14 @@ public class Config
 
     // Indexer Settings
     public int IndexerRetention { get; set; } = 0; // days - releases older than this won't be grabbed (0 = disabled)
+
+    /// <summary>
+    /// Grace period in days before the disk scanner hard-deletes an EventFile
+    /// row whose path has been continuously missing. Protects restore-to-new-
+    /// server flows, transient NAS unmounts, and similar scenarios. Default 30
+    /// days. Set to 0 to never auto-delete (user prunes manually).
+    /// </summary>
+    public int EventFileMissingDeleteAfterDays { get; set; } = 30;
     public bool PreferIndexerFlags { get; set; } = true; // prefer releases with special indexer flags (Freeleech, Scene, etc.)
 
     // Queue Threshold Settings (Huntarr-style)
@@ -165,6 +173,19 @@ public class Config
     public bool DvrEnableReconnect { get; set; } = true; // Enable stream reconnection on failures
     public int DvrMaxReconnectAttempts { get; set; } = 5; // Maximum reconnection attempts
     public int DvrReconnectDelaySeconds { get; set; } = 5; // Delay between reconnection attempts
+
+    /// <summary>
+    /// What happens when scheduling a new recording would push an
+    /// IPTV source past its MaxStreams cap or push the global
+    /// DvrMaxConcurrentRecordings cap. One of: "Refuse", "Queue",
+    /// "Preempt". Default Refuse - safest behavior; the user gets
+    /// an explicit error and can resolve the conflict manually.
+    /// Queue keeps the row in Scheduled state past its start time
+    /// until a slot opens. Preempt cancels the lowest-priority
+    /// active recording to make room (never preempts a recording
+    /// of higher or equal priority).
+    /// </summary>
+    public string DvrConflictPolicy { get; set; } = "Refuse";
 
     // Development Settings (hidden - only serialized to XML when set)
     public string CustomMetadataApiUrl { get; set; } = ""; // Custom metadata API URL for development/testing (empty = use default sportarr.net)

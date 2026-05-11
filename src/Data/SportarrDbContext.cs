@@ -126,6 +126,14 @@ public class SportarrDbContext : DbContext
             entity.Property(ef => ef.FilePath).IsRequired().HasMaxLength(1000);
             entity.Property(ef => ef.Quality).HasMaxLength(200);
             entity.Property(ef => ef.PartName).HasMaxLength(100);
+            entity.Property(ef => ef.IndexerFlags).HasMaxLength(200);
+            entity.Property(ef => ef.Languages).HasConversion(
+                v => System.Text.Json.JsonSerializer.Serialize(v, JsonSerializerOptionsProvider.Database),
+                v => System.Text.Json.JsonSerializer.Deserialize<List<string>>(v, JsonSerializerOptionsProvider.Database) ?? new List<string>()
+            ).Metadata.SetValueComparer(new ValueComparer<List<string>>(
+                (c1, c2) => c1 != null && c2 != null && c1.SequenceEqual(c2),
+                c => c.Aggregate(0, (a, v) => HashCode.Combine(a, v.GetHashCode())),
+                c => c.ToList()));
             entity.HasOne(ef => ef.Event)
                   .WithMany(e => e.Files)
                   .HasForeignKey(ef => ef.EventId)
@@ -151,6 +159,17 @@ public class SportarrDbContext : DbContext
             entity.HasIndex(l => l.ExternalId);
             entity.HasIndex(l => l.Sport);
             entity.HasIndex(l => new { l.Name, l.Sport });
+            entity.HasIndex(l => l.RootFolderId);
+            // Restrict on delete: a RootFolder with bound leagues can't be
+            // deleted via the cascade. The endpoint surfaces a 409 with the
+            // offending league IDs (Phase 2) so the user has to either
+            // unbind or force the delete explicitly. The navigation
+            // property on League now lets grab/import paths .Include the
+            // bound root folder for per-root default lookups (Phase 4).
+            entity.HasOne(l => l.RootFolder)
+                  .WithMany()
+                  .HasForeignKey(l => l.RootFolderId)
+                  .OnDelete(DeleteBehavior.Restrict);
             entity.Property(l => l.Tags).HasConversion(
                 v => System.Text.Json.JsonSerializer.Serialize(v, JsonSerializerOptionsProvider.Database),
                 v => System.Text.Json.JsonSerializer.Deserialize<List<int>>(v, JsonSerializerOptionsProvider.Database) ?? new List<int>()
@@ -860,6 +879,13 @@ public class SportarrDbContext : DbContext
                 (c1, c2) => c1 != null && c2 != null && c1.SequenceEqual(c2),
                 c => c.Aggregate(0, (a, v) => HashCode.Combine(a, v.GetHashCode())),
                 c => c.ToList()));
+            entity.Property(i => i.FailDownloads).HasConversion(
+                v => System.Text.Json.JsonSerializer.Serialize(v, JsonSerializerOptionsProvider.Database),
+                v => System.Text.Json.JsonSerializer.Deserialize<List<int>>(v, JsonSerializerOptionsProvider.Database) ?? new List<int>()
+            ).Metadata.SetValueComparer(new ValueComparer<List<int>>(
+                (c1, c2) => c1 != null && c2 != null && c1.SequenceEqual(c2),
+                c => c.Aggregate(0, (a, v) => HashCode.Combine(a, v.GetHashCode())),
+                c => c.ToList()));
             entity.HasOne(i => i.Status)
                   .WithOne(s => s.Indexer)
                   .HasForeignKey<IndexerStatus>(s => s.IndexerId)
@@ -1076,6 +1102,16 @@ public class SportarrDbContext : DbContext
                   .OnDelete(DeleteBehavior.Cascade);
             entity.HasIndex(m => new { m.ChannelId, m.LeagueId }).IsUnique();
             entity.HasIndex(m => m.IsPreferred);
+
+            // At most one preferred channel per league. Without this,
+            // concurrent writes to /preferred-channel can leave the
+            // DB with two preferred rows for the same league and the
+            // event-DVR scheduler will pick whichever EF returns first.
+            // Filtered unique index on SQLite via HasFilter.
+            entity.HasIndex(m => m.LeagueId)
+                  .IsUnique()
+                  .HasFilter("\"IsPreferred\" = 1")
+                  .HasDatabaseName("UX_ChannelLeagueMappings_PreferredPerLeague");
         });
 
         // DvrRecording configuration

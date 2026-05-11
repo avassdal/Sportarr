@@ -3,11 +3,12 @@ import { PlusIcon, PencilIcon, TrashIcon, CheckCircleIcon, XCircleIcon, Magnifyi
 import { toast } from 'sonner';
 import { useIndexers, useCreateIndexer, useUpdateIndexer, useDeleteIndexer, useBulkDeleteIndexers } from '../../api/hooks';
 import type { Indexer as ApiIndexer } from '../../types';
-import { apiGet, apiPut } from '../../utils/api';
+import { apiGet, apiPut, apiPost } from '../../utils/api';
 import apiClient from '../../api/client';
 import SettingsHeader from '../../components/SettingsHeader';
 import { useUnsavedChanges } from '../../hooks/useUnsavedChanges';
 import TagSelector from '../../components/TagSelector';
+import { MultiSelect } from '../../components/MultiSelect';
 
 
 interface Indexer {
@@ -35,6 +36,9 @@ interface Indexer {
   rejectBlocklistedTorrentHashes?: boolean;
   downloadClientId?: number;
   tags?: number[];
+  cookie?: string;
+  allowZeroSize?: boolean;
+  failDownloads?: number[];
 }
 
 type IndexerTemplate = {
@@ -87,6 +91,24 @@ const indexerTemplates: IndexerTemplate[] = [
     protocol: 'torrent',
     description: 'FileList - Torznab compatible indexer',
     fields: ['baseUrl', 'apiKey', 'categories', 'minimumSeeders', 'seedRatio', 'seedTime']
+  },
+  {
+    // Plain RSS feed: search isn't supported (the feed has no ?q=
+    // parameter), so this indexer type only contributes via the
+    // periodic RSS sync. The Test action runs the auto-detector and
+    // populates the parser config (ezRSS / enclosure / size source)
+    // before saving — the user just pastes the URL. Field set
+    // mirrors the upstream Torrent RSS Feed indexer's exposed
+    // settings (BaseUrl, Cookie, AllowZeroSize, MinimumSeeders,
+    // SeedCriteria) plus the shared advanced fields (Reject
+    // Blocklisted Torrent Hashes, Season-Pack Seed Time, Multi
+    // Languages) that auto-render in advanced mode for any torrent
+    // indexer.
+    name: 'Generic Torrent RSS Feed',
+    implementation: 'Rss',
+    protocol: 'torrent',
+    description: 'Plain RSS 2.0 feed (poll-only, no on-demand search). Use this for sites with an RSS feed but no Torznab/Newznab API.',
+    fields: ['baseUrl', 'cookie', 'minimumSeeders', 'allowZeroSize', 'seedRatio', 'seedTime']
   }
 ];
 
@@ -133,13 +155,16 @@ export default function IndexersSettings() {
       const multiLanguages = getField('multiLanguages') as string;
       const rejectBlocklistedTorrentHashes = getField('rejectBlocklistedTorrentHashes') as string;
       const downloadClientId = getField('downloadClientId') as string;
+      const cookie = getField('cookie') as string;
+      const allowZeroSize = getField('allowZeroSize') as string;
+      const failDownloads = getField('failDownloads') as string;
       // Tags come as a top-level property from the API, not from fields
       const apiTags = indexer.tags;
 
       // Determine protocol based on implementation type
-      // Torrent implementations: Torznab, Torrent, Nyaa, TorrentLeech, IPTorrents, FileList
-      // Usenet implementations: Newznab, Rss
-      const isTorrent = ['Torznab', 'Torrent', 'Nyaa', 'TorrentLeech', 'IPTorrents', 'FileList']
+      // Torrent implementations: Torznab, Torrent, Nyaa, TorrentLeech, IPTorrents, FileList, Rss
+      // Usenet implementations: Newznab
+      const isTorrent = ['Torznab', 'Torrent', 'Nyaa', 'TorrentLeech', 'IPTorrents', 'FileList', 'Rss']
         .some(impl => indexer.implementation.toLowerCase().includes(impl.toLowerCase()));
 
       return {
@@ -166,6 +191,11 @@ export default function IndexersSettings() {
         multiLanguages: multiLanguages ? multiLanguages.split(',').map(l => l.trim()) : undefined,
         rejectBlocklistedTorrentHashes: rejectBlocklistedTorrentHashes ? rejectBlocklistedTorrentHashes === 'true' : true,
         downloadClientId: downloadClientId ? parseInt(downloadClientId, 10) : undefined,
+        cookie: cookie || undefined,
+        allowZeroSize: allowZeroSize === 'true',
+        failDownloads: failDownloads
+          ? failDownloads.split(',').map(s => parseInt(s.trim(), 10)).filter(n => !Number.isNaN(n))
+          : [],
         tags: apiTags || []
       };
     });
@@ -303,6 +333,103 @@ export default function IndexersSettings() {
     setFormData(prev => ({ ...prev, [field]: value }));
   };
 
+  // Free-text mirror for the comma-separated category IDs input.
+  // Used as a fallback when the indexer's caps endpoint can't be
+  // reached (offline, missing API key, plain RSS, etc.). Otherwise the
+  // categories input renders as a Sonarr-style MultiSelect populated
+  // from caps. Keeping the raw text in state separately avoids the
+  // round-trip bug where re-parsing on every keystroke strips a
+  // trailing comma the user just typed.
+  const [categoriesText, setCategoriesText] = useState('');
+  useEffect(() => {
+    const parsedFromText = categoriesText
+      .split(',')
+      .map(c => parseInt(c.trim(), 10))
+      .filter(c => !isNaN(c));
+    const current = formData.categories || [];
+    const sameAsText =
+      parsedFromText.length === current.length &&
+      parsedFromText.every((v, i) => v === current[i]);
+    if (!sameAsText) {
+      setCategoriesText(current.join(', '));
+    }
+  }, [formData.categories]);
+
+  // Caps-driven category options. Sonarr renders the indexer's
+  // self-reported categories as a named multi-select instead of asking
+  // users to memorize numeric IDs. We mirror that: probe the indexer's
+  // /caps endpoint (newznab/torznab share the same XML schema) and use
+  // the result to populate a MultiSelect. Fall back to the text input
+  // when caps are unavailable so the form still works for sites
+  // without a reachable caps endpoint.
+  const [categoriesCaps, setCategoriesCaps] = useState<Array<{ id: string; name: string }> | null>(null);
+  const [capsLoading, setCapsLoading] = useState(false);
+  const [capsError, setCapsError] = useState<string | null>(null);
+
+  const implementation = formData.implementation || '';
+  const supportsCaps = implementation === 'Newznab' || implementation === 'Torznab' ||
+    // Other Torznab-compatible templates (TorrentLeech, IPTorrents, etc.)
+    // all expose a Newznab-style /caps endpoint.
+    selectedTemplate?.protocol === 'torrent' && implementation !== 'Rss';
+  const capsKey = `${implementation}|${formData.baseUrl || ''}|${formData.apiPath || ''}|${formData.apiKey || ''}`;
+
+  useEffect(() => {
+    if (!showAddModal) return;
+    if (!supportsCaps) {
+      setCategoriesCaps(null);
+      setCapsError(null);
+      return;
+    }
+    if (!formData.baseUrl) {
+      setCategoriesCaps(null);
+      setCapsError(null);
+      return;
+    }
+
+    let cancelled = false;
+    const handle = setTimeout(async () => {
+      setCapsLoading(true);
+      setCapsError(null);
+      try {
+        const fields = [
+          { name: 'baseUrl', value: formData.baseUrl || '' },
+          { name: 'apiPath', value: formData.apiPath || '/api' },
+          { name: 'apiKey', value: formData.apiKey || '' },
+        ];
+        const res = await apiPost('/api/indexer/caps', {
+          name: formData.name || 'Probe',
+          implementation,
+          fields,
+        });
+        if (cancelled) return;
+        if (res.ok) {
+          const data = await res.json();
+          setCategoriesCaps(Array.isArray(data.categories) ? data.categories : []);
+          setCapsError(null);
+        } else {
+          let msg = 'Could not load categories from indexer.';
+          try {
+            const err = await res.json();
+            if (err?.message) msg = err.message;
+          } catch { /* ignore */ }
+          setCategoriesCaps(null);
+          setCapsError(msg);
+        }
+      } catch (err) {
+        if (cancelled) return;
+        setCategoriesCaps(null);
+        setCapsError(err instanceof Error ? err.message : 'Failed to fetch categories');
+      } finally {
+        if (!cancelled) setCapsLoading(false);
+      }
+    }, 600);
+
+    return () => {
+      cancelled = true;
+      clearTimeout(handle);
+    };
+  }, [showAddModal, supportsCaps, capsKey]);
+
   // Helper function to convert component format to API format
   const toApiFormat = (indexer: Partial<Indexer>): Partial<ApiIndexer> => {
     const fields: { name: string; value: string | string[] }[] = [
@@ -340,14 +467,30 @@ export default function IndexersSettings() {
     if (indexer.downloadClientId !== undefined) {
       fields.push({ name: 'downloadClientId', value: String(indexer.downloadClientId) });
     }
+    // RSS-specific fields. Always emit when set so the backend can clear
+    // them by sending an empty string.
+    if (indexer.cookie !== undefined && indexer.cookie !== null) {
+      fields.push({ name: 'cookie', value: indexer.cookie });
+    }
+    if (indexer.allowZeroSize !== undefined) {
+      fields.push({ name: 'allowZeroSize', value: String(indexer.allowZeroSize) });
+    }
+    // Always emit failDownloads so the backend can clear the list by
+    // sending an empty string. List is converted back to int[] on the
+    // server side.
+    fields.push({ name: 'failDownloads', value: (indexer.failDownloads ?? []).join(',') });
+    // Plain RSS indexers can't satisfy a search — force the two
+    // search-enable flags off in the request so the UI doesn't show
+    // them as enabled while the backend silently rejects them.
+    const isRss = (indexer.implementation || '').toLowerCase() === 'rss';
     return {
       id: indexer.id,
       name: indexer.name || '',
       implementation: indexer.implementation || 'Torznab',
       enable: indexer.enabled ?? true,
       enableRss: indexer.enableRss ?? true,
-      enableAutomaticSearch: indexer.enableAutomaticSearch ?? true,
-      enableInteractiveSearch: indexer.enableInteractiveSearch ?? true,
+      enableAutomaticSearch: isRss ? false : (indexer.enableAutomaticSearch ?? true),
+      enableInteractiveSearch: isRss ? false : (indexer.enableInteractiveSearch ?? true),
       priority: indexer.priority || 25,
       fields,
       tags: indexer.tags || [],
@@ -456,13 +599,21 @@ export default function IndexersSettings() {
       const apiIndexer = toApiFormat(indexer);
 
       const response = await apiClient.post('/indexer/test', apiIndexer);
+      const successMessage = response.data?.message || 'Connection successful!';
       setTestResult({
         success: true,
-        message: response.data?.message || 'Connection successful!'
+        message: successMessage,
       });
 
+      // For plain-RSS indexers the backend's response message contains
+      // the auto-detected parser variant (e.g. "Detected ezRSS" or
+      // "Detected generic RSS — URL: enclosure, Size: parsed from
+      // <description>"). Surface it so the user can verify the
+      // detection picked the right shape before saving.
       toast.success('Test Successful', {
-        description: `Successfully connected to ${indexer.name || 'indexer'}`,
+        description: successMessage.startsWith('Detected')
+          ? successMessage
+          : `Successfully connected to ${indexer.name || 'indexer'}`,
       });
     } catch (error: any) {
       console.error('Test failed:', error);
@@ -606,6 +757,44 @@ export default function IndexersSettings() {
           </div>
         )}
 
+        {/* RSS-specific fields. Cookie supports protected feeds; AllowZeroSize
+            is needed for feeds whose RSS doesn't expose size at all. */}
+        {hasField('cookie') && (
+          <div>
+            <label className="block text-sm font-medium text-gray-300 mb-2">Cookie (optional)</label>
+            <input
+              type="text"
+              value={formData.cookie || ''}
+              onChange={(e) => handleFormChange('cookie', e.target.value)}
+              className="w-full px-4 py-2 bg-gray-800 border border-gray-700 rounded-lg text-white focus:outline-none focus:border-red-600"
+              placeholder="key=value; key2=value2"
+            />
+            <p className="text-xs text-gray-500 mt-1">
+              Required for protected feeds; leave empty otherwise.
+            </p>
+          </div>
+        )}
+
+        {hasField('allowZeroSize') && (
+          <label className="flex items-center space-x-3 cursor-pointer">
+            <input
+              type="checkbox"
+              checked={formData.allowZeroSize || false}
+              onChange={(e) => handleFormChange('allowZeroSize', e.target.checked)}
+              className="w-4 h-4 rounded border-gray-600 bg-gray-800 text-red-600 focus:ring-red-600"
+            />
+            <span className="text-sm font-medium text-gray-300">Allow zero-size releases</span>
+          </label>
+        )}
+
+        {/* Plain RSS notice — clarify the feature limit before the user
+            wonders why Manual Search never picks this indexer up. */}
+        {formData.implementation === 'Rss' && (
+          <div className="p-3 bg-yellow-900/30 border border-yellow-700/40 rounded-lg text-sm text-yellow-200">
+            <strong>RSS-only indexer:</strong> plain RSS feeds don't accept search queries, so this indexer only contributes during the periodic RSS sync. Manual / automatic searches will skip it.
+          </div>
+        )}
+
         {/* Authentication */}
         {hasField('apiKey') && (
           <div className="space-y-4">
@@ -638,20 +827,47 @@ export default function IndexersSettings() {
             <h4 className="text-lg font-semibold text-white">Categories</h4>
 
             <div>
-              <label className="block text-sm font-medium text-gray-300 mb-2">Category IDs</label>
-              <input
-                type="text"
-                value={(formData.categories || []).join(', ')}
-                onChange={(e) => {
-                  const cats = e.target.value.split(',').map(c => parseInt(c.trim())).filter(c => !isNaN(c));
-                  handleFormChange('categories', cats);
-                }}
-                className="w-full px-4 py-2 bg-gray-800 border border-gray-700 rounded-lg text-white focus:outline-none focus:border-red-600"
-                placeholder="5000, 5030, 5040 (combat sports categories)"
-              />
-              <p className="text-xs text-gray-500 mt-1">
-                Comma-separated category IDs. Leave empty to search all categories.
-              </p>
+              <label className="block text-sm font-medium text-gray-300 mb-2">Categories</label>
+              {categoriesCaps && categoriesCaps.length > 0 ? (
+                <>
+                  <MultiSelect<number>
+                    options={categoriesCaps
+                      .map(c => ({ value: parseInt(c.id, 10), label: c.name, hint: c.id }))
+                      .filter(o => !isNaN(o.value))
+                      .sort((a, b) => a.value - b.value)}
+                    value={formData.categories || []}
+                    onChange={(next) => handleFormChange('categories', next)}
+                    placeholder={capsLoading ? 'Loading categories…' : 'Select categories...'}
+                  />
+                  <p className="text-xs text-gray-500 mt-1">
+                    Pick categories the indexer should be searched in. Leave empty to use all categories.
+                  </p>
+                </>
+              ) : (
+                <>
+                  <input
+                    type="text"
+                    value={categoriesText}
+                    onChange={(e) => {
+                      setCategoriesText(e.target.value);
+                      const cats = e.target.value
+                        .split(',')
+                        .map(c => parseInt(c.trim(), 10))
+                        .filter(c => !isNaN(c));
+                      handleFormChange('categories', cats);
+                    }}
+                    className="w-full px-4 py-2 bg-gray-800 border border-gray-700 rounded-lg text-white focus:outline-none focus:border-red-600"
+                    placeholder="5000, 5030, 5040 (combat sports categories)"
+                  />
+                  <p className="text-xs text-gray-500 mt-1">
+                    {capsLoading
+                      ? 'Loading categories from indexer…'
+                      : capsError
+                        ? `${capsError} Falling back to manual entry: comma-separated category IDs.`
+                        : 'Comma-separated category IDs. Leave empty to search all categories.'}
+                  </p>
+                </>
+              )}
             </div>
 
           </div>
@@ -823,6 +1039,29 @@ export default function IndexersSettings() {
               />
               <p className="text-xs text-gray-500 mt-1">
                 Download client ID to use for this indexer. 0 = use default
+              </p>
+            </div>
+
+            {/* Fail Downloads — escalation policy. Selected categories
+                cause the import path to fail+blocklist a release whose
+                download folder contains a matching file extension,
+                instead of just warning. UserDefinedExtensions is paired
+                with the comma-separated UserRejectedExtensions input on
+                the Media Management settings page. */}
+            <div>
+              <label className="block text-sm font-medium text-gray-300 mb-2">Fail Downloads</label>
+              <MultiSelect<number>
+                options={[
+                  { value: 0, label: 'Executables', hint: '.bat, .cmd, .exe, .sh' },
+                  { value: 1, label: 'Potentially Dangerous', hint: '.arj, .lnk, .lzh, .ps1, .scr, .vbs, .zipx' },
+                  { value: 2, label: 'User-Defined Extensions', hint: 'See Media Management → Importing' },
+                ]}
+                value={formData.failDownloads || []}
+                onChange={(next) => handleFormChange('failDownloads', next)}
+                placeholder="Select categories to fail (optional)..."
+              />
+              <p className="text-xs text-gray-500 mt-1">
+                When the imported download folder contains a file with one of these extension types, treat the grab as failed (blocklist the release and trigger a re-search). Empty list = warn-only.
               </p>
             </div>
 

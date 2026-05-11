@@ -110,6 +110,12 @@ public class SeasonSearchService
                 continue;
             seenGuids.Add(release.Guid);
 
+            // Parse the release title once before the per-event loop. See
+            // RssSyncService.FindMatchingEvent for the rationale — without
+            // this, ValidateRelease re-parses the same string for every
+            // event in the season.
+            var preParsed = _releaseMatchingService.ParseRelease(release.Title);
+
             // Try to match this release to one or more events
             var matchedEvents = new List<SeasonEventMatch>();
 
@@ -119,7 +125,8 @@ public class SeasonSearchService
                     release,
                     evt,
                     requestedPart: null,
-                    enableMultiPartEpisodes: enableMultiPart);
+                    enableMultiPartEpisodes: enableMultiPart,
+                    preParsed: preParsed);
 
                 if (matchResult.IsMatch)
                 {

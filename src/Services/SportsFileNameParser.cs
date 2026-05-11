@@ -1,3 +1,4 @@
+using System.Collections.Concurrent;
 using System.Text.RegularExpressions;
 
 namespace Sportarr.Api.Services;
@@ -9,6 +10,17 @@ namespace Sportarr.Api.Services;
 public class SportsFileNameParser
 {
     private readonly ILogger<SportsFileNameParser> _logger;
+
+    // Memoization cache. Parse() is deterministic on its input and is
+    // hit inside hot loops — RssSyncService.FindMatchingEvent calls
+    // ValidateRelease once per monitored event, and each ValidateRelease
+    // call re-parses the same release title. Without this cache an RSS
+    // poll over N events × M releases re-runs the regex chain N×M
+    // times for SAME inputs. Bounded so memory doesn't drift up
+    // forever; clear-and-reset when full (~5k entries comfortably
+    // covers an hour of RSS feeds for a normal install).
+    private const int _parseCacheCapacity = 5000;
+    private static readonly ConcurrentDictionary<string, SportsParseResult> _parseCache = new();
 
     // Sports-specific naming patterns
     private static readonly List<SportsPattern> SportsPatterns = new()
@@ -461,11 +473,22 @@ public class SportsFileNameParser
     /// </summary>
     public SportsParseResult Parse(string filename)
     {
+        // Hot-path memoization. Parse(x) is deterministic; the same
+        // release title coming through RssSync's per-event loop only
+        // needs to run the regex chain once. Returns the cached result
+        // by reference — callers that mutate the returned object would
+        // pollute the cache, so SportsParseResult should stay
+        // effectively read-only at use sites (which it is today).
+        if (filename != null && _parseCache.TryGetValue(filename, out var cached))
+        {
+            return cached;
+        }
+
         _logger.LogDebug("Parsing sports filename: {Filename}", filename);
 
         var result = new SportsParseResult
         {
-            OriginalFilename = filename
+            OriginalFilename = filename ?? string.Empty
         };
 
         // Clean the filename (remove extension, replace dots/underscores with spaces for processing)
@@ -491,7 +514,18 @@ public class SportsFileNameParser
                 if (pattern.SessionExtractor != null)
                     result.Session = pattern.SessionExtractor(match);
 
-                _logger.LogInformation("Matched sports pattern: {Sport}/{Org} - {Title} (Round: {Round}, Location: {Location}, Session: {Session})",
+                // Debug-level on purpose. This line fires once per Parse()
+                // call, and Parse() is hit inside hot loops — RssSyncService
+                // re-parses every release once per monitored event in
+                // ValidateRelease, so a single RSS poll over N events × M
+                // releases produces N×M identical INFO lines for the same
+                // release title. With a few hundred monitored events that
+                // floods the log sink badly enough to make the container
+                // unresponsive over hours (the file sink buffer outpaces
+                // the writer and threads back up). Keep the data available
+                // at Debug level for when someone is actually diagnosing
+                // pattern matching, but don't ship it at INFO.
+                _logger.LogDebug("Matched sports pattern: {Sport}/{Org} - {Title} (Round: {Round}, Location: {Location}, Session: {Session})",
                     result.Sport, result.Organization, result.EventTitle, result.RoundNumber?.ToString() ?? "N/A", result.Location ?? "N/A", result.Session ?? "N/A");
                 break;
             }
@@ -563,6 +597,19 @@ public class SportsFileNameParser
         if (string.IsNullOrEmpty(result.EventTitle))
         {
             result = ExtractGenericInfo(cleanName, result);
+        }
+
+        // Memoize. Bounded by clear-when-full (cheap and good enough for
+        // a parse cache; we don't need LRU semantics here — parse
+        // results are tiny and the working set turns over with each
+        // RSS poll cycle).
+        if (filename != null)
+        {
+            if (_parseCache.Count >= _parseCacheCapacity)
+            {
+                _parseCache.Clear();
+            }
+            _parseCache.TryAdd(filename, result);
         }
 
         return result;

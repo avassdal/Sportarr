@@ -12,6 +12,7 @@ import {
   InformationCircleIcon
 } from '@heroicons/react/24/outline';
 import { apiGet, apiPost, apiPut } from '../utils/api';
+import FileMetadataEditor, { type FileMetadataEditorValues } from './FileMetadataEditor';
 
 interface League {
   id: number;
@@ -95,6 +96,29 @@ interface Props {
   onSuccess: () => void;
 }
 
+// Drop fields the user didn't fill in so the import endpoint doesn't apply
+// blank string overrides over good parser values. Languages is treated
+// specially: an empty array is a valid "no languages" state and gets sent.
+function stripEmptyOverrides(v: FileMetadataEditorValues) {
+  const out: Record<string, unknown> = {};
+  const setIfNonEmpty = (key: keyof FileMetadataEditorValues) => {
+    const val = v[key];
+    if (val == null) return;
+    if (typeof val === 'string' && val.trim() === '') return;
+    out[key] = val;
+  };
+  setIfNonEmpty('quality');
+  setIfNonEmpty('source');
+  setIfNonEmpty('codec');
+  setIfNonEmpty('releaseGroup');
+  setIfNonEmpty('originalTitle');
+  setIfNonEmpty('indexerFlags');
+  setIfNonEmpty('partName');
+  if (typeof v.partNumber === 'number') out.partNumber = v.partNumber;
+  if (Array.isArray(v.languages) && v.languages.length > 0) out.languages = v.languages;
+  return out;
+}
+
 export default function ManualImportModal({ pendingImport, onClose, onSuccess }: Props) {
   const [isLoading, setIsLoading] = useState(false);
 
@@ -112,6 +136,22 @@ export default function ManualImportModal({ pendingImport, onClose, onSuccess }:
     pendingImport.suggestedPart || null
   );
   const [selectedPartNumber, setSelectedPartNumber] = useState<number | null>(null);
+
+  // Pre-import metadata editor state. Pre-filled from the parser-derived values
+  // on the pending import; user can override any field before clicking Import.
+  // Sent to the accept endpoint as `metadataOverrides`.
+  const [editorValues, setEditorValues] = useState<FileMetadataEditorValues>({
+    quality: pendingImport.quality,
+    source: undefined,
+    codec: undefined,
+    releaseGroup: undefined,
+    originalTitle: pendingImport.title,
+    languages: [],
+    indexerFlags: undefined,
+    partName: pendingImport.suggestedPart,
+    partNumber: undefined,
+  });
+  const [showEditor, setShowEditor] = useState(false);
 
   // Data state
   const [leagues, setLeagues] = useState<League[]>([]);
@@ -324,8 +364,12 @@ export default function ManualImportModal({ pendingImport, onClose, onSuccess }:
         });
       }
 
-      // Accept the import
-      await apiPost(`/api/pending-imports/${pendingImport.id}/accept`, {});
+      // Accept the import — pass user-edited metadata overrides so the new
+      // EventFile lands with the corrected Quality / ReleaseGroup / Languages
+      // / etc. instead of whatever the parser guessed.
+      const metadataOverrides = stripEmptyOverrides(editorValues);
+      const acceptBody = Object.keys(metadataOverrides).length > 0 ? { metadataOverrides } : {};
+      await apiPost(`/api/pending-imports/${pendingImport.id}/accept`, acceptBody);
       onSuccess();
     } catch (error: any) {
       console.error('Failed to import:', error);
@@ -757,6 +801,46 @@ export default function ManualImportModal({ pendingImport, onClose, onSuccess }:
                   or ensure the event exists in your library.
                 </p>
               </div>
+            </div>
+          )}
+
+          {/* Pre-import metadata editor.
+              Lets the user override Quality, ReleaseGroup, Languages, etc. before
+              committing — same fields available post-import via the Files panel
+              pencil. Collapsible so it doesn't dominate the screen for users
+              who trust the parser. */}
+          {selectedEventId && (
+            <div className="bg-gray-800/40 border border-gray-700 rounded-lg overflow-hidden">
+              <button
+                type="button"
+                onClick={() => setShowEditor((s) => !s)}
+                className="w-full px-4 py-3 flex items-center justify-between text-left hover:bg-gray-800/60"
+              >
+                <div className="flex items-center gap-2">
+                  <FilmIcon className="w-5 h-5 text-emerald-400" />
+                  <span className="text-white font-medium">File Metadata</span>
+                  <span className="text-xs text-gray-400">
+                    {showEditor ? 'click to collapse' : 'click to override parser values'}
+                  </span>
+                </div>
+                <span className="text-xs text-gray-500">
+                  Quality: {editorValues.quality || 'auto-detect'}
+                  {editorValues.releaseGroup ? ` • Group: ${editorValues.releaseGroup}` : ''}
+                </span>
+              </button>
+              {showEditor && (
+                <div className="px-4 pb-4 pt-1">
+                  <FileMetadataEditor
+                    value={editorValues}
+                    onChange={setEditorValues}
+                    hideFields={pendingImport.suggestedPart ? [] : ['partName', 'partNumber']}
+                  />
+                  <p className="mt-3 text-xs text-gray-500">
+                    Empty fields here keep the parser's value. Anything you fill in will be applied
+                    after the import.
+                  </p>
+                </div>
+              )}
             </div>
           )}
         </div>

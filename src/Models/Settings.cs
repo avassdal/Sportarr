@@ -206,6 +206,15 @@ public class MediaManagementSettings
     public bool ImportExtraFiles { get; set; } = false;
     public string ExtraFileExtensions { get; set; } = "srt,nfo";
 
+    /// <summary>
+    /// Comma-separated list of file extensions the user wants to count
+    /// against an indexer's FailDownloads=UserDefinedExtensions policy.
+    /// e.g. ".nfo, .url, txt". Leave blank to disable the user-defined
+    /// category (the Executables / PotentiallyDangerous categories are
+    /// hardcoded and unaffected by this).
+    /// </summary>
+    public string? UserRejectedExtensions { get; set; }
+
     // Permissions
     public bool SetPermissions { get; set; } = false;
     public string FileChmod { get; set; } = "644";
@@ -225,16 +234,48 @@ public class MediaManagementSettings
     public DateTime? LastModified { get; set; }
 }
 
-// Root Folder Model
+// Root Folder Model. Only Id, Path, Created, and the optional
+// DefaultQualityProfileId / DefaultDownloadClientCategory are persisted —
+// Accessible / FreeSpace / TotalSpace are recomputed live every time
+// the API is read so the UI can't show stale "200 GiB free" while the
+// disk is actually full. NotMapped on those keeps the JSON response
+// shape unchanged for callers but tells EF to ignore them on read /
+// write so we can't accidentally trust the persisted value.
+//
+// The two Default* columns are a Sportarr-specific extension: users
+// often dedicate fast disks to current sports and archive disks to old
+// replays, so each root can hint a Quality Profile and a Download
+// Client category to apply to leagues bound under it. Both are
+// optional — leagues fall back to their explicit setting (or the
+// global default) when the root has nothing pinned.
 public class RootFolder
 {
     public int Id { get; set; }
     public required string Path { get; set; }
-    public bool Accessible { get; set; } = true;
-    public long FreeSpace { get; set; } = 0;
-    public long TotalSpace { get; set; } = 0;
     public DateTime Created { get; set; } = DateTime.UtcNow;
-    public DateTime LastChecked { get; set; } = DateTime.UtcNow;
+
+    /// <summary>
+    /// Optional default Quality Profile applied to leagues bound to this
+    /// root folder when the user doesn't pick one explicitly at add time.
+    /// </summary>
+    public int? DefaultQualityProfileId { get; set; }
+
+    /// <summary>
+    /// Optional download-client category override applied at grab time
+    /// for any event in a league bound to this root. When set, this
+    /// replaces the download client's configured Category for that grab.
+    /// </summary>
+    [System.ComponentModel.DataAnnotations.MaxLength(100)]
+    public string? DefaultDownloadClientCategory { get; set; }
+
+    [System.ComponentModel.DataAnnotations.Schema.NotMapped]
+    public bool Accessible { get; set; } = true;
+
+    [System.ComponentModel.DataAnnotations.Schema.NotMapped]
+    public long FreeSpace { get; set; } = 0;
+
+    [System.ComponentModel.DataAnnotations.Schema.NotMapped]
+    public long TotalSpace { get; set; } = 0;
 }
 
 // Import History
@@ -284,6 +325,11 @@ public class ParsedFileInfo
     public string? Edition { get; set; }
     public string? Language { get; set; }
     public bool IsProperOrRepack { get; set; }
+    /// <summary>Audio-stream language tags read from ffprobe (e.g. ["eng", "spa"]).
+    /// Populated by MediaFileInspector when filename parsing comes up short on
+    /// the Resolution / Source fields. Empty list if ffprobe wasn't run or
+    /// the file had no language tags.</summary>
+    public List<string> DetectedLanguages { get; set; } = new();
 }
 
 // File naming tokens and their replacements

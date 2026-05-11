@@ -75,6 +75,9 @@ app.MapGet("/api/settings", async (ConfigService configService, SportarrDbContex
         UseHardlinks = config.UseHardlinks,
         ImportExtraFiles = config.ImportExtraFiles,
         ExtraFileExtensions = config.ExtraFileExtensions,
+        // UserRejectedExtensions is paired with the FailDownloads
+        // policy on indexers — surfaced under Importing in the UI.
+        UserRejectedExtensions = dbMediaSettings?.UserRejectedExtensions,
         ChangeFileDate = config.ChangeFileDate,
         RecycleBin = config.RecycleBin,
         RecycleBinCleanup = config.RecycleBinCleanup,
@@ -115,9 +118,14 @@ app.MapGet("/api/settings", async (ConfigService configService, SportarrDbContex
             Password = "",
             ApiKey = config.ApiKey,
             CertificateValidation = config.CertificateValidation.ToLower(),
-            PasswordHash = config.PasswordHash,
-            PasswordSalt = config.PasswordSalt,
-            PasswordIterations = config.PasswordIterations
+            // Never echo the stored hash/salt/iterations to the browser.
+            // Echoing them back caused a round-trip bug where the frontend
+            // would re-submit the old hash on every save, and the PUT
+            // handler would overwrite the freshly-hashed new password with
+            // the stale value, silently keeping the old password active.
+            PasswordHash = "",
+            PasswordSalt = "",
+            PasswordIterations = 0
         }, jsonOptions),
 
         ProxySettings = System.Text.Json.JsonSerializer.Serialize(new ProxySettings
@@ -325,21 +333,12 @@ app.MapPut("/api/settings", async (AppSettings updatedSettings, ConfigService co
 
             // Don't overwrite API key from frontend (it's read-only, managed by regenerate endpoint)
 
-            // Password hash/salt are managed by SimpleAuthService.SetCredentialsAsync
-            // Only update if explicitly provided (non-empty), otherwise keep existing values
-            // Frontend doesn't send these fields, so they'll be null/empty
-            if (!string.IsNullOrEmpty(securitySettings.PasswordHash))
-            {
-                config.PasswordHash = securitySettings.PasswordHash;
-            }
-            if (!string.IsNullOrEmpty(securitySettings.PasswordSalt))
-            {
-                config.PasswordSalt = securitySettings.PasswordSalt;
-            }
-            if (securitySettings.PasswordIterations > 0)
-            {
-                config.PasswordIterations = securitySettings.PasswordIterations;
-            }
+            // Password hash/salt/iterations are managed exclusively by
+            // SimpleAuthService.SetCredentialsAsync (called above when the
+            // user provides a new plaintext password). Never accept these
+            // fields from the frontend payload: doing so previously
+            // clobbered the freshly-hashed new password with the stale
+            // hash that GET round-tripped to the browser.
 
             logger.LogInformation("[CONFIG] After update: AuthMethod={Method}, AuthRequired={Required}",
                 config.AuthenticationMethod, config.AuthenticationRequired);
@@ -481,6 +480,9 @@ app.MapPut("/api/settings", async (AppSettings updatedSettings, ConfigService co
                 UseHardlinks = mediaManagementSettings.UseHardlinks,
                 ImportExtraFiles = mediaManagementSettings.ImportExtraFiles,
                 ExtraFileExtensions = mediaManagementSettings.ExtraFileExtensions ?? "srt,nfo",
+                UserRejectedExtensions = string.IsNullOrWhiteSpace(mediaManagementSettings.UserRejectedExtensions)
+                    ? null
+                    : mediaManagementSettings.UserRejectedExtensions.Trim(),
                 ChangeFileDate = mediaManagementSettings.ChangeFileDate ?? "None",
                 RecycleBin = mediaManagementSettings.RecycleBin ?? "",
                 RecycleBinCleanup = mediaManagementSettings.RecycleBinCleanup,
@@ -518,6 +520,9 @@ app.MapPut("/api/settings", async (AppSettings updatedSettings, ConfigService co
             dbSettings.UseHardlinks = mediaManagementSettings.UseHardlinks;
             dbSettings.ImportExtraFiles = mediaManagementSettings.ImportExtraFiles;
             dbSettings.ExtraFileExtensions = mediaManagementSettings.ExtraFileExtensions;
+            dbSettings.UserRejectedExtensions = string.IsNullOrWhiteSpace(mediaManagementSettings.UserRejectedExtensions)
+                ? null
+                : mediaManagementSettings.UserRejectedExtensions.Trim();
             dbSettings.ChangeFileDate = mediaManagementSettings.ChangeFileDate;
             dbSettings.RecycleBin = mediaManagementSettings.RecycleBin;
             dbSettings.RecycleBinCleanup = mediaManagementSettings.RecycleBinCleanup;

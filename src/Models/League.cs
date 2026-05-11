@@ -1,4 +1,5 @@
 using System.Text.Json.Serialization;
+using Sportarr.Api.Helpers;
 
 namespace Sportarr.Api.Models;
 
@@ -78,6 +79,32 @@ public class League
     public string? Country { get; set; }
 
     /// <summary>
+    /// Comma-separated alternate names for this league as published by
+    /// the upstream API (e.g. "English Prem Rugby" has the alternate
+    /// "Gallagher Premiership Rugby" — the sponsor-branded name scene
+    /// release groups actually use). The release matcher splits on
+    /// commas and accepts any of the alternates as a valid league
+    /// reference, so a release titled "Gallagher Premiership..." gets
+    /// matched against the canonical league.
+    /// Sourced from TheSportsDB strLeagueAlternate via sportarr-api;
+    /// admins can set additional aliases via the metadata service UI.
+    /// </summary>
+    [JsonPropertyName("strLeagueAlternate")]
+    public string? AlternateName { get; set; }
+
+    /// <summary>
+    /// When the league's upstream metadata (AlternateName, LogoUrl,
+    /// Description, etc.) was last refreshed from the Sportarr API.
+    /// LeagueEventAutoSyncService re-pulls the league once a week
+    /// (TTL configured in LeagueEventSyncService) so legacy leagues
+    /// added before a new binding existed eventually pick it up
+    /// without an admin re-add. Null = never refreshed; gets set on
+    /// first successful upstream lookup. Not bound to any upstream
+    /// field — internal bookkeeping only.
+    /// </summary>
+    public DateTime? MetadataLastSyncedAt { get; set; }
+
+    /// <summary>
     /// League description
     /// </summary>
     [JsonPropertyName("strDescriptionEN")]
@@ -98,6 +125,23 @@ public class League
     /// Events can override this with their own QualityProfileId
     /// </summary>
     public int? QualityProfileId { get; set; }
+
+    /// <summary>
+    /// The RootFolder this league's media should live under. Set at add time
+    /// from the Add League modal and used by the import path builder so a
+    /// single league always lands in the same root regardless of which root
+    /// has the most free space at any given import. Null for legacy leagues
+    /// added before this column existed; the importer falls back to the
+    /// free-space heuristic in that case.
+    /// </summary>
+    public int? RootFolderId { get; set; }
+
+    /// <summary>
+    /// Navigation property to the bound RootFolder. Lets grab and import
+    /// services pull the per-root defaults (DefaultQualityProfileId,
+    /// DefaultDownloadClientCategory) without an extra round trip.
+    /// </summary>
+    public RootFolder? RootFolder { get; set; }
 
     /// <summary>
     /// Automatically search for missing events when league is added or settings are updated
@@ -142,22 +186,64 @@ public class League
     public string? SearchQueryTemplate { get; set; }
 
     /// <summary>
+    /// Override the global DVR pre-roll padding (minutes before the
+    /// scheduled event start) for this league. Null falls back to
+    /// sport-specific defaults, then to the global setting. Sports
+    /// like the NFL routinely run long; this lets the user pad NFL
+    /// recordings without inflating every other league's runtime.
+    /// </summary>
+    public int? DvrPrePadMinutes { get; set; }
+
+    /// <summary>
+    /// Override the global DVR post-roll padding (minutes after the
+    /// scheduled event end) for this league. Null falls back to the
+    /// sport-specific default in DvrPaddingDefaults, then to the
+    /// global setting. Useful for sports that overrun: NFL ~30,
+    /// NBA ~15, EPL ~10, UFC PPVs ~30, F1 ~15.
+    /// </summary>
+    public int? DvrPostRollMinutes { get; set; }
+
+    // Image URLs go through ImageUrlNormalizer on set so any legacy
+    // www.thesportsdb.com/images/... URL gets rewritten to the
+    // current r2.thesportsdb.com mirror as it lands. The legacy host
+    // returns 404 for image requests; the upstream API still hands
+    // us old URLs for older entities. Normalizing at the property
+    // setter catches every code path that writes the field — JSON
+    // deserialization, manual assignment, EF Core load — without
+    // having to touch each call site.
+
+    /// <summary>
     /// League logo/badge URL
     /// </summary>
     [JsonPropertyName("strBadge")]
-    public string? LogoUrl { get; set; }
+    public string? LogoUrl
+    {
+        get => _logoUrl;
+        set => _logoUrl = ImageUrlNormalizer.Normalize(value);
+    }
+    private string? _logoUrl;
 
     /// <summary>
     /// League banner image URL
     /// </summary>
     [JsonPropertyName("strBanner")]
-    public string? BannerUrl { get; set; }
+    public string? BannerUrl
+    {
+        get => _bannerUrl;
+        set => _bannerUrl = ImageUrlNormalizer.Normalize(value);
+    }
+    private string? _bannerUrl;
 
     /// <summary>
     /// League poster/trophy image URL
     /// </summary>
     [JsonPropertyName("strPoster")]
-    public string? PosterUrl { get; set; }
+    public string? PosterUrl
+    {
+        get => _posterUrl;
+        set => _posterUrl = ImageUrlNormalizer.Normalize(value);
+    }
+    private string? _posterUrl;
 
     /// <summary>
     /// Official league website
@@ -211,6 +297,12 @@ public class AddLeagueRequest
     public MonitorType MonitorType { get; set; } = MonitorType.Future;
 
     public int? QualityProfileId { get; set; }
+
+    /// <summary>
+    /// Optional root folder selection. If null, the importer picks by free
+    /// space; if set, the importer always uses this folder for the league.
+    /// </summary>
+    public int? RootFolderId { get; set; }
 
     /// <summary>
     /// Automatically search for missing events when league is added or settings are updated
@@ -283,6 +375,7 @@ public class AddLeagueRequest
             Monitored = Monitored,
             MonitorType = MonitorType,
             QualityProfileId = QualityProfileId,
+            RootFolderId = RootFolderId,
             SearchForMissingEvents = SearchForMissingEvents,
             SearchForCutoffUnmetEvents = SearchForCutoffUnmetEvents,
             MonitoredParts = MonitoredParts,
@@ -315,6 +408,7 @@ public class LeagueResponse
     public bool Monitored { get; set; }
     public MonitorType MonitorType { get; set; }
     public int? QualityProfileId { get; set; }
+    public int? RootFolderId { get; set; }
     public bool SearchForMissingEvents { get; set; }
     public bool SearchForCutoffUnmetEvents { get; set; }
     public string? MonitoredParts { get; set; }
@@ -419,6 +513,7 @@ public class LeagueResponse
             Monitored = league.Monitored,
             MonitorType = league.MonitorType,
             QualityProfileId = league.QualityProfileId,
+            RootFolderId = league.RootFolderId,
             SearchForMissingEvents = league.SearchForMissingEvents,
             SearchForCutoffUnmetEvents = league.SearchForCutoffUnmetEvents,
             MonitoredParts = league.MonitoredParts,

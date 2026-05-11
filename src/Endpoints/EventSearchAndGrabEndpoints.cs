@@ -119,7 +119,13 @@ app.MapPost("/api/release/grab", async (
 
     logger.LogInformation("[GRAB] Manual grab requested for event {EventId}: {Title}", eventId, release.Title);
 
-    var evt = await db.Events.FindAsync(eventId);
+    // Pull the league + bound root folder along with the event so the
+    // category cascade (Phase 4) can resolve the per-root override
+    // without an extra round trip.
+    var evt = await db.Events
+        .Include(e => e.League)
+        .ThenInclude(l => l!.RootFolder)
+        .FirstOrDefaultAsync(e => e.Id == eventId);
     if (evt == null)
     {
         logger.LogWarning("[GRAB] Event {EventId} not found", eventId);
@@ -152,7 +158,20 @@ app.MapPost("/api/release/grab", async (
 
     // NOTE: We do NOT specify download path - download client uses its own configured directory.
     // The category is used to track Sportarr downloads and create subdirectories.
-    logger.LogInformation("[GRAB] Category: {Category}", downloadClient.Category);
+    // If the event's league is bound to a root folder with a
+    // DefaultDownloadClientCategory pinned, that overrides the download
+    // client's configured Category for this grab — lets users route a
+    // "fast SSD" league through one category and an "archive HDD"
+    // league through another even when both share a download client.
+    var grabCategory = !string.IsNullOrWhiteSpace(evt.League?.RootFolder?.DefaultDownloadClientCategory)
+        ? evt.League.RootFolder.DefaultDownloadClientCategory!
+        : downloadClient.Category;
+    if (grabCategory != downloadClient.Category)
+    {
+        logger.LogInformation("[GRAB] Using root-folder default category '{RootCategory}' instead of download client's '{ClientCategory}'",
+            grabCategory, downloadClient.Category);
+    }
+    logger.LogInformation("[GRAB] Category: {Category}", grabCategory);
     logger.LogInformation("[GRAB] ========== STARTING DOWNLOAD GRAB ==========");
     logger.LogInformation("[GRAB] Release Title: {Title}", release.Title);
     logger.LogInformation("[GRAB] Release Quality: {Quality}", release.Quality);
@@ -183,7 +202,7 @@ app.MapPost("/api/release/grab", async (
         downloadResult = await downloadClientService.AddDownloadWithResultAsync(
             downloadClient,
             release.DownloadUrl,
-            downloadClient.Category,
+            grabCategory,
             release.Title,
             grabIndexerRecord?.SeedRatio,
             grabIndexerRecord?.SeedTime

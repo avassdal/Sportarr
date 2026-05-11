@@ -453,6 +453,11 @@ public class IndexerSearchService : IIndexerSearchService
                 {
                     IndexerType.Torznab => await SearchTorznabAsync(indexer, query, maxResults),
                     IndexerType.Newznab => await SearchNewznabAsync(indexer, query, maxResults),
+                    // Plain-RSS indexers don't support search — the feed
+                    // has no ?q= parameter, so RSS is poll-only. Mirrors
+                    // the upstream "Torrent RSS Feed" indexer's
+                    // SupportsSearch=false. Returning empty here means
+                    // RSS results only ever come from FetchRssFeedAsync.
                     _ => new List<ReleaseSearchResult>()
                 };
 
@@ -579,6 +584,7 @@ public class IndexerSearchService : IIndexerSearchService
             {
                 IndexerType.Torznab => await TestTorznabAsync(indexer),
                 IndexerType.Newznab => await TestNewznabAsync(indexer),
+                IndexerType.Rss => await TestRssAsync(indexer),
                 _ => false
             };
         }
@@ -663,6 +669,7 @@ public class IndexerSearchService : IIndexerSearchService
                 {
                     IndexerType.Torznab => await FetchTorznabRssAsync(indexer, maxResults),
                     IndexerType.Newznab => await FetchNewznabRssAsync(indexer, maxResults),
+                    IndexerType.Rss => await FetchPlainRssAsync(indexer, maxResults),
                     _ => new List<ReleaseSearchResult>()
                 };
 
@@ -780,6 +787,42 @@ public class IndexerSearchService : IIndexerSearchService
         var client = new NewznabClient(httpClient, newznabLogger);
 
         return await client.TestConnectionAsync(indexer);
+    }
+
+    private async Task<List<ReleaseSearchResult>> FetchPlainRssAsync(Indexer indexer, int maxResults)
+    {
+        var client = BuildRssClient();
+        return await client.FetchRssFeedAsync(indexer, maxResults);
+    }
+
+    private async Task<bool> TestRssAsync(Indexer indexer)
+    {
+        var client = BuildRssClient();
+        return await client.TestConnectionAsync(indexer);
+    }
+
+    /// <summary>
+    /// Probe the RSS feed for the given indexer, write the auto-detected
+    /// parser config back onto the entity, and return a friendly summary.
+    /// Caller (the Test endpoint) is responsible for db.SaveChangesAsync
+    /// when Success is true. When Success is false the indexer entity is
+    /// left untouched so the bad probe doesn't half-save bogus settings.
+    /// </summary>
+    public async Task<RssDetectionResult> DetectRssSettingsAsync(Indexer indexer)
+    {
+        if (indexer.Type != IndexerType.Rss)
+        {
+            return new RssDetectionResult(false, "Auto-detect only runs for plain-RSS indexers.");
+        }
+        var client = BuildRssClient();
+        return await client.DetectAndSaveSettingsAsync(indexer);
+    }
+
+    private RssClient BuildRssClient()
+    {
+        var httpClient = _httpClientFactory.CreateClient("IndexerClient");
+        var rssLogger = _loggerFactory.CreateLogger<RssClient>();
+        return new RssClient(httpClient, rssLogger);
     }
 }
 

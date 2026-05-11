@@ -2,6 +2,7 @@ using Microsoft.AspNetCore.Builder;
 using Microsoft.AspNetCore.Http;
 using Microsoft.AspNetCore.Routing;
 using Microsoft.EntityFrameworkCore;
+using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
 using Sportarr.Api.Data;
 using Sportarr.Api.Models;
@@ -45,7 +46,10 @@ app.MapGet("/api/indexer", async (SportarrDbContext db) =>
             new { name = "additionalParameters", value = i.AdditionalParameters ?? "" },
             new { name = "multiLanguages", value = i.MultiLanguages != null ? string.Join(",", i.MultiLanguages) : "" },
             new { name = "rejectBlocklistedTorrentHashes", value = i.RejectBlocklistedTorrentHashes.ToString() },
-            new { name = "downloadClientId", value = i.DownloadClientId?.ToString() ?? "" }
+            new { name = "downloadClientId", value = i.DownloadClientId?.ToString() ?? "" },
+            new { name = "cookie", value = i.Cookie ?? "" },
+            new { name = "allowZeroSize", value = i.RssAllowZeroSize.ToString().ToLowerInvariant() },
+            new { name = "failDownloads", value = string.Join(",", i.FailDownloads ?? new List<int>()) }
         },
         tags = i.Tags ?? new List<int>()
     }).ToList();
@@ -69,9 +73,7 @@ app.MapPost("/api/indexer", async (HttpRequest request, SportarrDbContext db, IL
         var indexer = new Indexer
         {
             Name = apiIndexer.GetProperty("name").GetString() ?? "Unknown",
-            Type = apiIndexer.GetProperty("implementation").GetString()?.ToLower() == "newznab"
-                ? IndexerType.Newznab
-                : IndexerType.Torznab,
+            Type = ResolveIndexerType(apiIndexer.GetProperty("implementation").GetString()),
             Url = "",
             ApiKey = "",
             Created = DateTime.UtcNow
@@ -143,8 +145,43 @@ app.MapPost("/api/indexer", async (HttpRequest request, SportarrDbContext db, IL
                             indexer.SeedTime = seedTime;
                         }
                         break;
+                    case "cookie":
+                        indexer.Cookie = string.IsNullOrWhiteSpace(fieldValue) ? null : fieldValue;
+                        break;
+                    case "allowZeroSize":
+                        indexer.RssAllowZeroSize = string.Equals(fieldValue, "true", StringComparison.OrdinalIgnoreCase);
+                        break;
+                    case "failDownloads":
+                        indexer.FailDownloads = string.IsNullOrWhiteSpace(fieldValue)
+                            ? new List<int>()
+                            : fieldValue.Split(',', StringSplitOptions.RemoveEmptyEntries)
+                                .Select(s => int.TryParse(s.Trim(), out var v) ? (int?)v : null)
+                                .Where(v => v.HasValue)
+                                .Select(v => v!.Value)
+                                .ToList();
+                        break;
                 }
             }
+        }
+
+        // Plain-RSS indexers can't satisfy a targeted search (no ?q=
+        // parameter), so the two search-enable flags are forced off
+        // regardless of what the request asked for. Auto-detect the
+        // parser variant so the user doesn't have to fiddle with the
+        // ezRSS / enclosure / description-regex switches by hand.
+        if (indexer.Type == IndexerType.Rss)
+        {
+            indexer.EnableAutomaticSearch = false;
+            indexer.EnableInteractiveSearch = false;
+
+            var detectorService = request.HttpContext.RequestServices.GetRequiredService<IndexerSearchService>();
+            var detection = await detectorService.DetectRssSettingsAsync(indexer);
+            if (!detection.Success)
+            {
+                logger.LogWarning("[INDEXER CREATE] RSS auto-detect failed for {Name}: {Reason}", indexer.Name, detection.Message);
+                return Results.BadRequest(new { success = false, message = detection.Message });
+            }
+            logger.LogInformation("[INDEXER CREATE] RSS auto-detect: {Summary}", detection.Message);
         }
 
         logger.LogInformation("[INDEXER CREATE] Creating {Type} indexer: {Name} at {Url}{ApiPath}",
@@ -184,7 +221,7 @@ app.MapPut("/api/indexer/{id:int}", async (int id, HttpRequest request, Sportarr
         }
         if (apiIndexer.TryGetProperty("implementation", out var impl))
         {
-            indexer.Type = impl.GetString()?.ToLower() == "newznab" ? IndexerType.Newznab : IndexerType.Torznab;
+            indexer.Type = ResolveIndexerType(impl.GetString());
         }
 
         // Update enable/disable flags
@@ -263,6 +300,21 @@ app.MapPut("/api/indexer/{id:int}", async (int id, HttpRequest request, Sportarr
                             indexer.SeedTime = seedTime;
                         }
                         break;
+                    case "cookie":
+                        indexer.Cookie = string.IsNullOrWhiteSpace(fieldValue) ? null : fieldValue;
+                        break;
+                    case "allowZeroSize":
+                        indexer.RssAllowZeroSize = string.Equals(fieldValue, "true", StringComparison.OrdinalIgnoreCase);
+                        break;
+                    case "failDownloads":
+                        indexer.FailDownloads = string.IsNullOrWhiteSpace(fieldValue)
+                            ? new List<int>()
+                            : fieldValue.Split(',', StringSplitOptions.RemoveEmptyEntries)
+                                .Select(s => int.TryParse(s.Trim(), out var v) ? (int?)v : null)
+                                .Where(v => v.HasValue)
+                                .Select(v => v!.Value)
+                                .ToList();
+                        break;
                 }
             }
         }
@@ -272,6 +324,13 @@ app.MapPut("/api/indexer/{id:int}", async (int id, HttpRequest request, Sportarr
         {
             indexer.Tags = System.Text.Json.JsonSerializer.Deserialize<List<int>>(indexerTags.GetRawText()) ?? new();
             db.Entry(indexer).Property(i => i.Tags).IsModified = true;
+        }
+
+        // Plain-RSS still can't satisfy a search after edit either.
+        if (indexer.Type == IndexerType.Rss)
+        {
+            indexer.EnableAutomaticSearch = false;
+            indexer.EnableInteractiveSearch = false;
         }
 
         indexer.LastModified = DateTime.UtcNow;
@@ -385,6 +444,99 @@ app.MapPost("/api/release/search", async (
     return Results.Ok(results);
 });
 
+// API: Fetch supported categories for an in-progress indexer config.
+// Used by the indexer edit form to render a Sonarr-style multi-select
+// of named categories rather than a free-text comma-separated ID box.
+// Takes the same payload shape as /api/indexer/test (Prowlarr-style
+// fields array) so the frontend can probe before save without
+// persisting anything.
+app.MapPost("/api/indexer/caps", async (
+    HttpRequest request,
+    IHttpClientFactory httpClientFactory,
+    ILoggerFactory loggerFactory,
+    ILogger<Program> logger) =>
+{
+    try
+    {
+        using var reader = new StreamReader(request.Body);
+        var json = await reader.ReadToEndAsync();
+        var apiIndexer = System.Text.Json.JsonSerializer.Deserialize<System.Text.Json.JsonElement>(json);
+
+        var implementation = apiIndexer.TryGetProperty("implementation", out var implProp)
+            ? implProp.GetString()
+            : null;
+        var indexerType = ResolveIndexerType(implementation);
+
+        // Caps lookup only makes sense for Newznab/Torznab. Plain RSS
+        // feeds don't expose a /caps endpoint.
+        if (indexerType != IndexerType.Torznab && indexerType != IndexerType.Newznab)
+        {
+            return Results.BadRequest(new { success = false, message = "Caps lookup is only supported for Newznab and Torznab indexers." });
+        }
+
+        var probe = new Indexer
+        {
+            Name = apiIndexer.TryGetProperty("name", out var n) ? (n.GetString() ?? "Probe") : "Probe",
+            Type = indexerType,
+            Url = "",
+            ApiKey = ""
+        };
+
+        if (apiIndexer.TryGetProperty("fields", out var fields))
+        {
+            foreach (var field in fields.EnumerateArray())
+            {
+                var fieldName = field.GetProperty("name").GetString();
+                var fieldValue = field.GetProperty("value").GetString();
+                switch (fieldName)
+                {
+                    case "baseUrl":
+                        probe.Url = fieldValue?.TrimEnd('/') ?? "";
+                        break;
+                    case "apiPath":
+                        var apiPath = fieldValue ?? "/api";
+                        probe.ApiPath = apiPath.StartsWith('/') ? apiPath : $"/{apiPath}";
+                        break;
+                    case "apiKey":
+                        probe.ApiKey = fieldValue;
+                        break;
+                }
+            }
+        }
+
+        if (string.IsNullOrWhiteSpace(probe.Url))
+        {
+            return Results.BadRequest(new { success = false, message = "baseUrl is required to fetch categories." });
+        }
+
+        // Newznab and Torznab share the same caps XML schema, so we
+        // route both through TorznabClient.GetCapabilitiesAsync. Caps
+        // lookup doesn't need quality detection, so we omit it.
+        var httpClient = httpClientFactory.CreateClient("IndexerClient");
+        var torznabLogger = loggerFactory.CreateLogger<TorznabClient>();
+        var client = new TorznabClient(httpClient, torznabLogger);
+
+        var caps = await client.GetCapabilitiesAsync(probe);
+        if (caps == null)
+        {
+            return Results.BadRequest(new { success = false, message = "Could not reach the indexer's caps endpoint. Check the URL and API key." });
+        }
+
+        var categoryDtos = caps.Categories
+            .Where(c => !string.IsNullOrWhiteSpace(c.Id) && !string.IsNullOrWhiteSpace(c.Name))
+            .Select(c => new { id = c.Id, name = c.Name })
+            .ToList();
+
+        logger.LogInformation("[INDEXER CAPS] Fetched {Count} categories from {Url}", categoryDtos.Count, probe.Url);
+        return Results.Ok(new { success = true, categories = categoryDtos });
+    }
+    catch (Exception ex)
+    {
+        logger.LogError(ex, "[INDEXER CAPS] Error fetching caps: {Message}", ex.Message);
+        return Results.BadRequest(new { success = false, message = $"Failed to fetch categories: {ex.Message}" });
+    }
+});
+
 // API: Test indexer connection
 app.MapPost("/api/indexer/test", async (
     HttpRequest request,
@@ -405,9 +557,7 @@ app.MapPost("/api/indexer/test", async (
         var indexer = new Indexer
         {
             Name = apiIndexer.GetProperty("name").GetString() ?? "Test",
-            Type = apiIndexer.GetProperty("implementation").GetString()?.ToLower() == "newznab"
-                ? IndexerType.Newznab
-                : IndexerType.Torznab,
+            Type = ResolveIndexerType(apiIndexer.GetProperty("implementation").GetString()),
             Url = "",
             ApiKey = ""
         };
@@ -446,6 +596,21 @@ app.MapPost("/api/indexer/test", async (
                             indexer.MinimumSeeders = minSeeders;
                         }
                         break;
+                    case "cookie":
+                        indexer.Cookie = string.IsNullOrWhiteSpace(fieldValue) ? null : fieldValue;
+                        break;
+                    case "allowZeroSize":
+                        indexer.RssAllowZeroSize = string.Equals(fieldValue, "true", StringComparison.OrdinalIgnoreCase);
+                        break;
+                    case "failDownloads":
+                        indexer.FailDownloads = string.IsNullOrWhiteSpace(fieldValue)
+                            ? new List<int>()
+                            : fieldValue.Split(',', StringSplitOptions.RemoveEmptyEntries)
+                                .Select(s => int.TryParse(s.Trim(), out var v) ? (int?)v : null)
+                                .Where(v => v.HasValue)
+                                .Select(v => v!.Value)
+                                .ToList();
+                        break;
                 }
             }
         }
@@ -454,6 +619,23 @@ app.MapPost("/api/indexer/test", async (
             indexer.Type, indexer.Name, indexer.Url, indexer.ApiPath);
         logger.LogInformation("[INDEXER TEST] ApiKey present: {HasApiKey}, Categories: {Categories}",
             !string.IsNullOrEmpty(indexer.ApiKey), string.Join(",", indexer.Categories ?? new List<string>()));
+
+        // Plain-RSS test path is special: instead of a yes/no probe, run
+        // the auto-detector. The user gets back a friendly summary of
+        // what was discovered ("Detected ezRSS" / "Generic — size from
+        // <description>") so they can verify the parser variant before
+        // saving.
+        if (indexer.Type == IndexerType.Rss)
+        {
+            var detection = await indexerSearchService.DetectRssSettingsAsync(indexer);
+            if (detection.Success)
+            {
+                logger.LogInformation("[INDEXER TEST] ✓ RSS test succeeded for {Name}: {Summary}", indexer.Name, detection.Message);
+                return Results.Ok(new { success = true, message = detection.Message });
+            }
+            logger.LogWarning("[INDEXER TEST] ✗ RSS test failed for {Name}: {Reason}", indexer.Name, detection.Message);
+            return Results.BadRequest(new { success = false, message = detection.Message });
+        }
 
         var success = await indexerSearchService.TestIndexerAsync(indexer);
 
@@ -474,5 +656,24 @@ app.MapPost("/api/indexer/test", async (
 });
 
         return app;
+    }
+
+    /// <summary>
+    /// Map the upstream-style implementation string to our IndexerType
+    /// enum. The frontend templates send "Newznab" / "Torznab" / "Rss"
+    /// / "TorrentRss" / "Torrent RSS Feed" interchangeably depending on
+    /// where the template label was authored, so we tolerate all of them
+    /// and default to Torznab on anything unrecognized to preserve
+    /// existing behavior.
+    /// </summary>
+    private static IndexerType ResolveIndexerType(string? implementation)
+    {
+        var key = implementation?.Trim().ToLowerInvariant() ?? "";
+        return key switch
+        {
+            "newznab" => IndexerType.Newznab,
+            "rss" or "torrentrss" or "torrent rss feed" => IndexerType.Rss,
+            _ => IndexerType.Torznab,
+        };
     }
 }

@@ -111,9 +111,14 @@ export default function LeagueSearchPage() {
   const filteredLeagues = useMemo(() => {
     let filtered = allLeagues;
 
-    // Filter by sport category
+    // Filter by sport category. Compare case-insensitively because
+    // the same sport can ship from upstream with mixed casing
+    // ("Motorsport" vs "MotorSport") and we collapse those into a
+    // single chip above; an exact-equality filter here would only
+    // match one variant's leagues.
     if (selectedSport !== 'all') {
-      filtered = filtered.filter(league => league.strSport === selectedSport);
+      const target = selectedSport.toLowerCase();
+      filtered = filtered.filter(league => (league.strSport ?? '').toLowerCase() === target);
     }
 
     // Filter by search query
@@ -149,12 +154,26 @@ export default function LeagueSearchPage() {
 
   const sportFilters = useMemo(() => {
     const filters = [{ id: 'all', name: 'All Sports', icon: '🌍' }];
-    const uniqueSports = Array.from(new Set(
-      allLeagues
-        .filter(l => !isInternalLeagueName(l.strLeague ?? ''))
-        .map(l => l.strSport)
-        .filter(Boolean)
-    )).sort((a, b) => a.localeCompare(b));
+
+    // Case-insensitive dedup. The upstream metadata API has at least
+    // one inconsistency where a sport ships as both "Motorsport" and
+    // "MotorSport" depending on the league row, and a plain Set
+    // treats those as distinct - producing two visually identical
+    // chips on this page. Group by lowercase, keep the lexically
+    // first variant so the displayed casing is stable across
+    // refreshes regardless of which row was synced first.
+    const byLower = new Map<string, string>();
+    for (const l of allLeagues) {
+      if (isInternalLeagueName(l.strLeague ?? '')) continue;
+      const sport = l.strSport;
+      if (!sport) continue;
+      const key = sport.toLowerCase();
+      const existing = byLower.get(key);
+      if (existing == null || sport.localeCompare(existing) < 0) {
+        byLower.set(key, sport);
+      }
+    }
+    const uniqueSports = Array.from(byLower.values()).sort((a, b) => a.localeCompare(b));
 
     uniqueSports.forEach(sport => {
       filters.push({ id: sport, name: sport, icon: getSportIcon(sport) });
@@ -175,7 +194,8 @@ export default function LeagueSearchPage() {
       monitoredSessionTypes,
       monitoredEventTypes,
       searchQueryTemplate,
-      tags
+      tags,
+      rootFolderId,
     }: {
       league: League;
       monitoredTeamIds: string[];
@@ -188,6 +208,7 @@ export default function LeagueSearchPage() {
       monitoredEventTypes: string | null;
       searchQueryTemplate?: string | null;
       tags?: number[];
+      rootFolderId?: number | null;
     }) => {
       // Teamless sports (motorsport, golf, darts, climbing, gambling, individual
       // tennis, badminton, table tennis, snooker) and fighting leagues that
@@ -213,6 +234,7 @@ export default function LeagueSearchPage() {
         monitoredEventTypes: monitoredEventTypes,
         searchQueryTemplate: searchQueryTemplate,
         tags: tags,
+        rootFolderId: rootFolderId,
         logoUrl: league.strBadge || league.strLogo,
         bannerUrl: league.strBanner,
         posterUrl: league.strPoster,
@@ -447,6 +469,7 @@ export default function LeagueSearchPage() {
     monitoredEventTypes: string | null,
     searchQueryTemplate: string | null,
     tags: number[],
+    rootFolderId: number | null,
   ) => {
     const modalData = addModalDataRef.current;
     if (modalData?.editMode && modalData.leagueId) {
@@ -478,7 +501,8 @@ export default function LeagueSearchPage() {
         monitoredSessionTypes,
         monitoredEventTypes,
         searchQueryTemplate,
-        tags
+        tags,
+        rootFolderId
       });
     }
   };
@@ -525,7 +549,7 @@ export default function LeagueSearchPage() {
             return (
               <tr
                 key={league.idLeague}
-                onClick={() => { if (!isAdded) handleCardClick(league, isAdded, addedLeagueInfo); }}
+                onClick={() => handleCardClick(league, isAdded, addedLeagueInfo)}
                 className={`${TABLE_ROW_HOVER} cursor-pointer ${isAdded ? 'bg-green-900/10' : ''}`}
               >
                 <td className="px-3 py-3">

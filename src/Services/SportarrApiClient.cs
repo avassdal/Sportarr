@@ -127,6 +127,42 @@ public class SportarrApiClient
     }
 
     /// <summary>
+    /// Ensure Event.BroadcastDate is populated. The Sportarr API
+    /// (sportarr-api / sportarr-hub) computes broadcastDate from
+    /// each league's IANA broadcast timezone and exposes it on every
+    /// event-bearing response — that's the authoritative source and
+    /// JSON binding fills BroadcastDate directly via JsonPropertyName.
+    ///
+    /// This fallback only kicks in for two cases:
+    ///   1. The API responded with a stale-cached payload predating
+    ///      the broadcastDate rollout (no field on the event).
+    ///   2. Older code paths or tests that synthesize events without
+    ///      hitting the live API.
+    ///
+    /// In both cases we degrade to the UTC date (via dateEvent or
+    /// EventDate.Date). That date drifts a day for late-Eastern games
+    /// whose UTC instant rolls over before broadcast ends — known
+    /// limitation, matches the pre-broadcastDate behavior, gets
+    /// corrected on the next live fetch. Filename services treat
+    /// BroadcastDate as authoritative.
+    /// </summary>
+    private static void ApplyBroadcastDateFallback(IEnumerable<Event>? events)
+    {
+        if (events == null) return;
+        foreach (var evt in events) ApplyBroadcastDateFallback(evt);
+    }
+
+    private static void ApplyBroadcastDateFallback(Event? evt)
+    {
+        if (evt == null) return;
+        if (evt.BroadcastDate.HasValue) return;
+        if (evt.DateEventFallback != DateTime.MinValue)
+            evt.BroadcastDate = evt.DateEventFallback.Date;
+        else if (evt.EventDate != DateTime.MinValue)
+            evt.BroadcastDate = evt.EventDate.Date;
+    }
+
+    /// <summary>
     /// Search for events by name
     /// </summary>
     public async Task<List<Event>?> SearchEventAsync(string query)
@@ -139,7 +175,9 @@ public class SportarrApiClient
 
             var json = await response.Content.ReadAsStringAsync();
             var result = JsonSerializer.Deserialize<SportarrApiSearchResponse<Event>>(json, _jsonOptions);
-            return result?.Data?.Search;
+            var events = result?.Data?.Search;
+            ApplyBroadcastDateFallback(events);
+            return events;
         }
         catch (Exception ex)
         {
@@ -231,7 +269,9 @@ public class SportarrApiClient
 
             var json = await response.Content.ReadAsStringAsync();
             var result = JsonSerializer.Deserialize<SportarrApiResponse<Event>>(json, _jsonOptions);
-            return result?.Data?.FirstOrDefault();
+            var evt = result?.Data?.FirstOrDefault();
+            ApplyBroadcastDateFallback(evt);
+            return evt;
         }
         catch (Exception ex)
         {
@@ -257,7 +297,9 @@ public class SportarrApiClient
 
             var json = await response.Content.ReadAsStringAsync();
             var result = JsonSerializer.Deserialize<SportarrApiResponse<Event>>(json, _jsonOptions);
-            return result?.Data;
+            var events = result?.Data;
+            ApplyBroadcastDateFallback(events);
+            return events;
         }
         catch (Exception ex)
         {
@@ -279,7 +321,9 @@ public class SportarrApiClient
 
             var json = await response.Content.ReadAsStringAsync();
             var result = JsonSerializer.Deserialize<SportarrApiResponse<Event>>(json, _jsonOptions);
-            return result?.Data;
+            var events = result?.Data;
+            ApplyBroadcastDateFallback(events);
+            return events;
         }
         catch (Exception ex)
         {
@@ -315,12 +359,20 @@ public class SportarrApiClient
     /// Get all available seasons for a league
     /// Returns list of seasons that actually exist in Sportarr API (no more guessing years!)
     /// </summary>
-    public async Task<List<Season>?> GetAllSeasonsAsync(string leagueId)
+    public async Task<List<Season>?> GetAllSeasonsAsync(string leagueId, bool forceRefresh = false)
     {
         try
         {
             var url = $"{_apiBaseUrl}/list/seasons/{Uri.EscapeDataString(leagueId)}";
-            using var response = await _httpClient.GetAsync(url);
+            using var request = new HttpRequestMessage(HttpMethod.Get, url);
+            if (forceRefresh)
+            {
+                // Tells sportarr.net to bypass its own cache and refetch from
+                // TheSportsDB on this request only. Used by the user-driven
+                // blue refresh button so a click guarantees fresh data.
+                request.Headers.CacheControl = new System.Net.Http.Headers.CacheControlHeaderValue { NoCache = true };
+            }
+            using var response = await _httpClient.SendAsync(request);
             response.EnsureSuccessStatusCode();
 
             var json = await response.Content.ReadAsStringAsync();
@@ -374,12 +426,20 @@ public class SportarrApiClient
     /// <summary>
     /// Get all events for a league season
     /// </summary>
-    public async Task<List<Event>?> GetLeagueSeasonAsync(string leagueId, string season)
+    public async Task<List<Event>?> GetLeagueSeasonAsync(string leagueId, string season, bool forceRefresh = false)
     {
         try
         {
             var url = $"{_apiBaseUrl}/schedule/league/{Uri.EscapeDataString(leagueId)}/{Uri.EscapeDataString(season)}";
-            using var response = await _httpClient.GetAsync(url);
+            using var request = new HttpRequestMessage(HttpMethod.Get, url);
+            if (forceRefresh)
+            {
+                // Tells sportarr.net to bypass its own cache and refetch from
+                // TheSportsDB on this request only. Used by the user-driven
+                // blue refresh button so a click guarantees fresh schedule data.
+                request.Headers.CacheControl = new System.Net.Http.Headers.CacheControlHeaderValue { NoCache = true };
+            }
+            using var response = await _httpClient.SendAsync(request);
             response.EnsureSuccessStatusCode();
 
             var json = await response.Content.ReadAsStringAsync();
@@ -555,7 +615,9 @@ public class SportarrApiClient
 
             var json = await response.Content.ReadAsStringAsync();
             var result = JsonSerializer.Deserialize<SportarrApiResponse<Event>>(json, _jsonOptions);
-            return result?.Data;
+            var events = result?.Data;
+            ApplyBroadcastDateFallback(events);
+            return events;
         }
         catch (Exception ex)
         {
@@ -577,7 +639,9 @@ public class SportarrApiClient
 
             var json = await response.Content.ReadAsStringAsync();
             var result = JsonSerializer.Deserialize<SportarrApiResponse<Event>>(json, _jsonOptions);
-            return result?.Data;
+            var events = result?.Data;
+            ApplyBroadcastDateFallback(events);
+            return events;
         }
         catch (Exception ex)
         {

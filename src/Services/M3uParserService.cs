@@ -188,6 +188,70 @@ public class M3uParserService
     private HttpClient GetHttpClient() => _httpClientFactory.CreateClient("IptvClient");
 
     /// <summary>
+    /// Decode an HTTP response body as a string while tolerating two
+    /// shapes that ReadAsStringAsync() handles badly:
+    ///   1. A UTF-8 BOM (EF BB BF) at the start - .NET keeps it as
+    ///      U+FEFF, which then breaks the very first "#EXTM3U" detect.
+    ///   2. Bodies served as Windows-1252 or ISO-8859-1 with no
+    ///      Content-Type charset, where .NET defaults to UTF-8 and
+    ///      mangles non-ASCII channel names ("BeIN N°1" etc).
+    /// We pick the charset from the response if present, otherwise
+    /// sniff a BOM, otherwise try UTF-8 strict and fall back to
+    /// Windows-1252 on decode failure.
+    /// </summary>
+    private static async Task<string> ReadResponseTextAsync(HttpResponseMessage response)
+    {
+        // Make sure Windows-1252 is registered - .NET 8 doesn't
+        // include the legacy code pages by default. Idempotent.
+        System.Text.Encoding.RegisterProvider(System.Text.CodePagesEncodingProvider.Instance);
+
+        var bytes = await response.Content.ReadAsByteArrayAsync();
+        if (bytes.Length == 0) return string.Empty;
+
+        var charset = response.Content.Headers.ContentType?.CharSet;
+
+        System.Text.Encoding? encoding = null;
+        // BOM sniff first - it's authoritative.
+        if (bytes.Length >= 3 && bytes[0] == 0xEF && bytes[1] == 0xBB && bytes[2] == 0xBF)
+        {
+            encoding = new System.Text.UTF8Encoding(encoderShouldEmitUTF8Identifier: false, throwOnInvalidBytes: false);
+            return encoding.GetString(bytes, 3, bytes.Length - 3);
+        }
+        if (bytes.Length >= 2 && bytes[0] == 0xFF && bytes[1] == 0xFE)
+        {
+            return System.Text.Encoding.Unicode.GetString(bytes, 2, bytes.Length - 2);
+        }
+        if (bytes.Length >= 2 && bytes[0] == 0xFE && bytes[1] == 0xFF)
+        {
+            return System.Text.Encoding.BigEndianUnicode.GetString(bytes, 2, bytes.Length - 2);
+        }
+
+        if (!string.IsNullOrEmpty(charset))
+        {
+            try { encoding = System.Text.Encoding.GetEncoding(charset.Trim('"')); }
+            catch { /* unknown charset - fall through to sniff */ }
+        }
+
+        if (encoding == null)
+        {
+            // Try strict UTF-8 first; if it throws on invalid bytes,
+            // fall back to Windows-1252 which is the de facto IPTV
+            // provider default.
+            try
+            {
+                var strict = new System.Text.UTF8Encoding(encoderShouldEmitUTF8Identifier: false, throwOnInvalidBytes: true);
+                return strict.GetString(bytes);
+            }
+            catch (System.Text.DecoderFallbackException)
+            {
+                encoding = System.Text.Encoding.GetEncoding(1252);
+            }
+        }
+
+        return encoding.GetString(bytes);
+    }
+
+    /// <summary>
     /// Fetch and parse an M3U playlist from a URL
     /// </summary>
     public async Task<List<IptvChannel>> ParseFromUrlAsync(string url, int sourceId, string? userAgent = null)
@@ -211,7 +275,7 @@ public class M3uParserService
             var response = await GetHttpClient().SendAsync(request);
             response.EnsureSuccessStatusCode();
 
-            var content = await response.Content.ReadAsStringAsync();
+            var content = await ReadResponseTextAsync(response);
             return ParseContent(content, sourceId);
         }
         catch (Exception ex)
@@ -508,7 +572,7 @@ public class M3uParserService
             var response = await GetHttpClient().SendAsync(request);
             response.EnsureSuccessStatusCode();
 
-            var content = await response.Content.ReadAsStringAsync();
+            var content = await ReadResponseTextAsync(response);
 
             // Count EXTINF lines for quick estimate
             return content.Split('\n')

@@ -469,10 +469,37 @@ app.MapPut("/api/pending-imports/{id:int}/suggestion", async (
 
 app.MapPost("/api/pending-imports/{id:int}/accept", async (
     int id,
+    HttpRequest req,
     SportarrDbContext db,
     FileImportService fileImportService) =>
 {
-    // Accept a pending import and perform the actual import
+    // Accept a pending import and perform the actual import.
+    // Body is optional: when present, may carry { metadataOverrides: { quality, source,
+    // codec, releaseGroup, originalTitle, languages, indexerFlags, partName, partNumber } }
+    // which the editor modal sends so user-corrected values land on the EventFile
+    // before it goes live in the library.
+    Sportarr.Api.Endpoints.EventFileEditorEndpoints.EventFileEditRequest? overrides = null;
+    if (req.ContentLength > 0)
+    {
+        try
+        {
+            using var doc = await System.Text.Json.JsonDocument.ParseAsync(req.Body);
+            if (doc.RootElement.ValueKind == System.Text.Json.JsonValueKind.Object &&
+                doc.RootElement.TryGetProperty("metadataOverrides", out var ov) &&
+                ov.ValueKind == System.Text.Json.JsonValueKind.Object)
+            {
+                overrides = System.Text.Json.JsonSerializer.Deserialize
+                    <Sportarr.Api.Endpoints.EventFileEditorEndpoints.EventFileEditRequest>(
+                    ov.GetRawText(),
+                    new System.Text.Json.JsonSerializerOptions { PropertyNameCaseInsensitive = true });
+            }
+        }
+        catch
+        {
+            // Body was empty or unparseable — ignore, accept without overrides.
+        }
+    }
+
     var import = await db.PendingImports
         .Include(pi => pi.DownloadClient)
         .Include(pi => pi.SuggestedEvent)
@@ -572,6 +599,24 @@ app.MapPost("/api/pending-imports/{id:int}/accept", async (
         import.Status = PendingImportStatus.Completed;
         import.ResolvedAt = DateTime.UtcNow;
         await db.SaveChangesAsync();
+
+        // Apply user-supplied metadata overrides (from the import-modal editor)
+        // to the EventFile that was just created. Done after SaveChanges so the
+        // disk-discovered branch's newly-added row has an Id we can find. For the
+        // FileImportService branch we look up the most-recent EventFile for the
+        // target event, which is reliable because we just created it.
+        if (overrides != null)
+        {
+            var newFile = await db.EventFiles
+                .Where(f => f.EventId == import.SuggestedEventId.Value)
+                .OrderByDescending(f => f.Id)
+                .FirstOrDefaultAsync();
+            if (newFile != null)
+            {
+                Sportarr.Api.Endpoints.EventFileEditorEndpoints.ApplyEdits(newFile, overrides);
+                await db.SaveChangesAsync();
+            }
+        }
 
         return Results.Ok(import);
     }

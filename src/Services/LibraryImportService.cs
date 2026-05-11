@@ -19,6 +19,7 @@ public class LibraryImportService
     private readonly EventPartDetector _partDetector;
     private readonly ConfigService _configService;
     private readonly SportarrApiClient _sportarrApiClient;
+    private readonly DiskSpaceService _diskSpaceService;
 
     private static readonly string[] VideoExtensions = SupportedExtensions.Video;
 
@@ -30,7 +31,8 @@ public class LibraryImportService
         FileNamingService namingService,
         EventPartDetector partDetector,
         ConfigService configService,
-        SportarrApiClient sportarrApiClient)
+        SportarrApiClient sportarrApiClient,
+        DiskSpaceService diskSpaceService)
     {
         _db = db;
         _logger = logger;
@@ -40,6 +42,7 @@ public class LibraryImportService
         _partDetector = partDetector;
         _configService = configService;
         _sportarrApiClient = sportarrApiClient;
+        _diskSpaceService = diskSpaceService;
     }
 
     /// <summary>
@@ -85,7 +88,10 @@ public class LibraryImportService
 
                     // Try sports-specific parser first for better accuracy
                     var sportsResult = _sportsParser.Parse(filename);
-                    var parsedInfo = _fileParser.Parse(filename);
+                    // ParseWithInspectionAsync runs ffprobe when the filename alone doesn't
+                    // give us a Resolution+Source pair. Costs ~50-200ms per uninformative
+                    // file but produces accurate Quality on first scan.
+                    var parsedInfo = await _fileParser.ParseWithInspectionAsync(filename, filePath);
 
                     // Use sports parser if it has high confidence
                     var eventTitle = sportsResult.Confidence >= 60 && !string.IsNullOrEmpty(sportsResult.EventTitle)
@@ -135,6 +141,12 @@ public class LibraryImportService
                             ParsedSport = sport,
                             ParsedDate = eventDate,
                             Quality = parsedInfo.Quality,
+                            Source = parsedInfo.Source,
+                            Codec = parsedInfo.VideoCodec,
+                            AudioCodec = parsedInfo.AudioCodec,
+                            ReleaseGroup = parsedInfo.ReleaseGroup,
+                            OriginalTitle = filename,
+                            Languages = parsedInfo.DetectedLanguages,
                             ExistingEventId = linkedEvent?.Id,
                             MatchedEventTitle = BuildCurrentLabel(linkedEvent, existingEventFile)
                         });
@@ -200,6 +212,12 @@ public class LibraryImportService
                         ParsedSport = sport,
                         ParsedDate = eventDate,
                         Quality = parsedInfo.Quality,
+                        Source = parsedInfo.Source,
+                        Codec = parsedInfo.VideoCodec,
+                        AudioCodec = parsedInfo.AudioCodec,
+                        ReleaseGroup = parsedInfo.ReleaseGroup,
+                        OriginalTitle = filename,
+                        Languages = parsedInfo.DetectedLanguages,
                         MatchedEventId = matchedEvent?.Id,
                         MatchedEventTitle = matchedEvent?.Title,
                         MatchedLeagueName = matchedEvent?.League?.Name,
@@ -262,7 +280,12 @@ public class LibraryImportService
                 var sourceFileInfo = new FileInfo(request.FilePath);
                 // Capture file size BEFORE moving - after move, source file won't exist
                 var sourceFileSize = sourceFileInfo.Length;
-                var parsedInfo = _fileParser.Parse(Path.GetFileNameWithoutExtension(request.FilePath));
+                // ParseWithInspectionAsync runs ffprobe when the filename alone doesn't
+                // yield a usable Resolution+Source pair. This is what saves library imports
+                // of files like "match.mkv" from ending up with Quality=Unknown.
+                var parsedInfo = await _fileParser.ParseWithInspectionAsync(
+                    Path.GetFileNameWithoutExtension(request.FilePath),
+                    request.FilePath);
 
                 // Parse import mode from request: "move" or "copy"
                 // Default behavior based on CopyFiles setting:
@@ -354,16 +377,22 @@ public class LibraryImportService
                         }
                         else
                         {
-                            // Create new EventFile record
+                            // Create new EventFile record. User-supplied overrides
+                            // (from the FileMetadataEditor) take precedence over the
+                            // parser's guesses for Codec / Source / ReleaseGroup /
+                            // OriginalTitle / Languages / IndexerFlags.
                             var eventFile = new EventFile
                             {
                                 EventId = existingEvent.Id,
                                 FilePath = destinationPath,
                                 Size = sourceFileSize,
                                 Quality = request.Quality ?? _fileParser.BuildQualityString(parsedInfo),
-                                Codec = parsedInfo.VideoCodec,
-                                Source = parsedInfo.Source,
-                                ReleaseGroup = parsedInfo.ReleaseGroup,
+                                Codec = request.Codec ?? parsedInfo.VideoCodec,
+                                Source = request.Source ?? parsedInfo.Source,
+                                ReleaseGroup = request.ReleaseGroup ?? parsedInfo.ReleaseGroup,
+                                OriginalTitle = request.OriginalTitle,
+                                Languages = request.Languages ?? new List<string>(),
+                                IndexerFlags = request.IndexerFlags,
                                 PartName = partName,
                                 PartNumber = partNumber,
                                 Added = DateTime.UtcNow,
@@ -457,16 +486,20 @@ public class LibraryImportService
                     newEvent.FilePath = destinationPath;
                     newEvent.HasFile = true;
 
-                    // Create EventFile record (part info already determined above)
+                    // Create EventFile record (part info already determined above).
+                    // User-supplied overrides take precedence over parser values.
                     var eventFile = new EventFile
                     {
                         EventId = newEvent.Id,
                         FilePath = destinationPath,
                         Size = sourceFileSize,
                         Quality = request.Quality ?? _fileParser.BuildQualityString(parsedInfo),
-                        Codec = parsedInfo.VideoCodec,
-                        Source = parsedInfo.Source,
-                        ReleaseGroup = parsedInfo.ReleaseGroup,
+                        Codec = request.Codec ?? parsedInfo.VideoCodec,
+                        Source = request.Source ?? parsedInfo.Source,
+                        ReleaseGroup = request.ReleaseGroup ?? parsedInfo.ReleaseGroup,
+                        OriginalTitle = request.OriginalTitle,
+                        Languages = request.Languages ?? new List<string>(),
+                        IndexerFlags = request.IndexerFlags,
                         PartName = partName,
                         PartNumber = partNumber,
                         Added = DateTime.UtcNow,
@@ -517,8 +550,11 @@ public class LibraryImportService
         var sourceFileInfo = new FileInfo(sourcePath);
         var extension = sourceFileInfo.Extension;
 
-        // Get best root folder
-        var rootFolder = await GetBestRootFolderAsync(settings, sourceFileInfo.Length);
+        // Resolve the root folder for this league. Prefers the league's
+        // explicit RootFolderId binding (set via the Add League modal),
+        // falls back to the legacy free-space heuristic when the league
+        // doesn't have one or the bound folder is missing/inaccessible.
+        var rootFolder = await GetRootFolderForLeagueAsync(settings, eventInfo.League, sourceFileInfo.Length);
 
         // Build destination path
         var destinationPath = rootFolder;
@@ -577,18 +613,22 @@ public class LibraryImportService
                 }
             }
 
+            // Filename tokens use BroadcastDate (broadcaster-branded);
+            // see FileRenameService for the rationale.
+            var brandingDate = eventInfo.BroadcastDate ?? eventInfo.EventDate.Date;
+
             var tokens = new FileNamingTokens
             {
                 EventTitle = eventInfo.Title,
                 EventTitleThe = eventInfo.Title,
-                AirDate = eventInfo.EventDate,
+                AirDate = brandingDate,
                 Quality = parsed.Quality ?? "Unknown",
                 QualityFull = _fileParser.BuildQualityString(parsed),
                 ReleaseGroup = parsed.ReleaseGroup ?? string.Empty,
                 OriginalTitle = parsed.EventTitle,
                 OriginalFilename = Path.GetFileNameWithoutExtension(sourcePath),
                 Series = eventInfo.League?.Name ?? eventInfo.Sport,
-                Season = eventInfo.SeasonNumber?.ToString("0000") ?? eventInfo.Season ?? DateTime.UtcNow.Year.ToString(),
+                Season = eventInfo.SeasonNumber?.ToString("0000") ?? eventInfo.Season ?? brandingDate.Year.ToString(),
                 Episode = episodeNumber.ToString("00"),
                 Part = partSuffix
             };
@@ -636,10 +676,30 @@ public class LibraryImportService
     }
 
     /// <summary>
-    /// Get best root folder based on free space
+    /// Resolve the root folder a league's media should be written into.
+    /// Prefers the explicit binding stored on the league, falls back to
+    /// the legacy free-space heuristic for legacy leagues without a
+    /// binding or whose bound root has gone missing.
     /// </summary>
-    private Task<string> GetBestRootFolderAsync(MediaManagementSettings settings, long fileSize)
+    private Task<string> GetRootFolderForLeagueAsync(MediaManagementSettings settings, League? league, long fileSize)
     {
+        if (settings.RootFolders == null || settings.RootFolders.Count == 0)
+        {
+            throw new Exception("No root folders configured. Please add a root folder in Settings > Media Management.");
+        }
+
+        if (league?.RootFolderId is int boundId)
+        {
+            var bound = settings.RootFolders.FirstOrDefault(rf => rf.Id == boundId);
+            if (bound != null && bound.Accessible)
+            {
+                return Task.FromResult(bound.Path);
+            }
+            _logger.LogWarning(
+                "[Root Folders] League {LeagueId} ({LeagueName}) is bound to RootFolderId={BoundId} but it's missing or inaccessible — falling back to free-space selection.",
+                league.Id, league.Name, boundId);
+        }
+
         var rootFolders = settings.RootFolders
             .Where(rf => rf.Accessible)
             .OrderByDescending(rf => rf.FreeSpace)
@@ -988,10 +1048,7 @@ public class LibraryImportService
         var rootFolders = await _db.RootFolders.ToListAsync();
         if (rootFolders.Any())
         {
-            foreach (var folder in rootFolders)
-            {
-                folder.Accessible = Directory.Exists(folder.Path);
-            }
+            _diskSpaceService.RefreshLiveState(rootFolders);
             settings.RootFolders = rootFolders;
         }
 
@@ -1281,18 +1338,19 @@ public class LibraryImportService
         {
             // Use the actual file format with all tokens including episode number
             var episodeNumber = matchedEvent.EpisodeNumber ?? 1;
+            var brandingDate = matchedEvent.BroadcastDate ?? matchedEvent.EventDate.Date;
             var tokens = new FileNamingTokens
             {
                 EventTitle = matchedEvent.Title,
                 EventTitleThe = matchedEvent.Title,
-                AirDate = matchedEvent.EventDate,
+                AirDate = brandingDate,
                 Quality = "WEBDL-1080p", // Preview placeholder
                 QualityFull = "WEBDL-1080p",
                 ReleaseGroup = string.Empty,
                 OriginalTitle = matchedEvent.Title,
                 OriginalFilename = Path.GetFileNameWithoutExtension(originalFileName),
                 Series = matchedEvent.League?.Name ?? matchedEvent.Sport ?? "Unknown",
-                Season = matchedEvent.SeasonNumber?.ToString("0000") ?? matchedEvent.Season ?? matchedEvent.EventDate.Year.ToString(),
+                Season = matchedEvent.SeasonNumber?.ToString("0000") ?? matchedEvent.Season ?? brandingDate.Year.ToString(),
                 Episode = episodeNumber.ToString("00"),
                 Part = string.Empty
             };
@@ -1478,6 +1536,22 @@ public class ImportableFile
     public string? ParsedSport { get; set; }
     public DateTime? ParsedDate { get; set; }
     public string? Quality { get; set; }
+    /// <summary>Source bucket (WEBDL / BLURAY / HDTV / DVDRIP / RAWHD) parsed from the
+    /// filename, with extension hint and ffprobe augmentation as fallbacks.</summary>
+    public string? Source { get; set; }
+    /// <summary>Video codec normalized form (x264 / x265 / AV1 / VP9 / MPEG2 / XviD)
+    /// — falls back to ffprobe inspection when the filename has no codec token.</summary>
+    public string? Codec { get; set; }
+    /// <summary>Audio codec (AAC / AC3 / E-AC-3 / DTS / TrueHD / FLAC / Opus / MP3) —
+    /// from filename or ffprobe.</summary>
+    public string? AudioCodec { get; set; }
+    /// <summary>Release group token from filename's trailing "-GROUP".</summary>
+    public string? ReleaseGroup { get; set; }
+    /// <summary>The full original filename without extension — preserved verbatim so
+    /// the user can re-search the indexer with this exact title later.</summary>
+    public string? OriginalTitle { get; set; }
+    /// <summary>Languages detected by ffprobe from audio stream language tags.</summary>
+    public List<string> Languages { get; set; } = new();
     public int? MatchedEventId { get; set; }
     public string? MatchedEventTitle { get; set; }
     public string? MatchedLeagueName { get; set; }
@@ -1546,6 +1620,19 @@ public class FileImportRequest
     /// - "copy": Copies files or creates hardlinks based on settings
     /// </summary>
     public string? ImportMode { get; set; }
+
+    /// <summary>
+    /// Optional pre-import metadata overrides supplied by the user via the
+    /// FileMetadataEditor. Applied to the new EventFile after creation so
+    /// user-corrected values stick instead of getting overwritten by the
+    /// parser. Mirrors the EventFileEditRequest shape one-to-one.
+    /// </summary>
+    public string? Source { get; set; }
+    public string? Codec { get; set; }
+    public string? ReleaseGroup { get; set; }
+    public string? OriginalTitle { get; set; }
+    public List<string>? Languages { get; set; }
+    public string? IndexerFlags { get; set; }
 }
 
 /// <summary>

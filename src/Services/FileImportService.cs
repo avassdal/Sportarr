@@ -1,10 +1,49 @@
 using System.Runtime.InteropServices;
 using Sportarr.Api.Data;
+using Sportarr.Api.Helpers;
 using Sportarr.Api.Models;
 using Sportarr.Api.Services.Interfaces;
 using Microsoft.EntityFrameworkCore;
 
 namespace Sportarr.Api.Services;
+
+/// <summary>
+/// Thrown by the import path when a file in the download folder matches
+/// a category the indexer's FailDownloads policy says should be treated
+/// as a hard fail (rather than a soft "warn but keep importing"). The
+/// monitor service catches this specifically and skips the retry-count
+/// loop — straight to Failed status, which triggers the existing
+/// blocklist + research pipeline. Message is the user-facing reason.
+/// </summary>
+public class IndexerFailDownloadException : Exception
+{
+    public FailDownloads Reason { get; }
+
+    public IndexerFailDownloadException(FailDownloads reason, string message) : base(message)
+    {
+        Reason = reason;
+    }
+}
+
+/// <summary>
+/// Thrown by the import path when the download client itself signaled
+/// the download as failed — typically by leaving the folder named with
+/// a "working folder" prefix like _FAILED_ or _UNPACK_ (SABnzbd's
+/// post-processing failure marker; matched against
+/// Config.DownloadClientWorkingFolders). Without this guard, an
+/// unpack-failed SAB download would keep getting re-grabbed forever —
+/// the import retries 3× into the empty FAILED folder, the release
+/// never lands on the blocklist, and the next RSS sync grabs the same
+/// broken NZB. Catching this in the monitor pins to Failed on the
+/// first attempt so HandleFailedDownload's existing blocklist + retry
+/// search runs.
+/// </summary>
+public class DownloadFailedException : Exception
+{
+    public DownloadFailedException(string message) : base(message)
+    {
+    }
+}
 
 /// <summary>
 /// Handles importing downloaded media files into the library
@@ -138,6 +177,31 @@ public class FileImportService : IFileImportService
                     "SOLUTION 2: If paths differ between containers, configure Remote Path Mapping in Settings > Download Clients.");
             }
 
+            // Defense-in-depth check for download-client-flagged failures.
+            // SABnzbd renames a folder to _FAILED_<original> when post-
+            // processing (par2 repair, unpack, post-script, etc.) fails,
+            // but its history record may still report status="completed"
+            // — so the import path can reach this point on a download
+            // that has nothing to import. Walking the empty folder, hitting
+            // "no video files," and bumping ImportRetryCount to 3 just
+            // wastes the retry budget and never blocklists, so the next
+            // RSS sync re-grabs the same broken NZB. Detect the prefix
+            // here and throw the typed exception so the monitor pins the
+            // download to Failed on the first attempt and the existing
+            // HandleFailedDownload status-transition path adds the
+            // blocklist entry. Prefix list is configurable via
+            // Config.DownloadClientWorkingFolders.
+            CheckDownloadClientWorkingFolderPrefix(downloadPath);
+
+            // FailDownloads policy check. Walk every file in the download
+            // folder and check its extension against the indexer's
+            // configured FailDownloads categories. A match throws an
+            // IndexerFailDownloadException that the monitor service
+            // routes straight to Failed status (skip retry, blocklist,
+            // re-search). Indexers with no FailDownloads opinion (or
+            // downloads with no IndexerId) skip this block entirely.
+            await CheckFailDownloadsAsync(download, downloadPath);
+
             // Find video files
             var videoFiles = FindVideoFiles(downloadPath);
 
@@ -196,12 +260,14 @@ public class FileImportService : IFileImportService
             _logger.LogInformation("Found video file: {File} ({Size:N0} bytes)",
                 sourceFile, actualFileSize);
 
-            // Parse filename
-            var parsed = _parser.Parse(Path.GetFileName(sourceFile));
+            // Parse filename, augmenting with ffprobe inspection when the filename
+            // alone doesn't yield a Resolution+Source pair. download.Quality (the
+            // original release-title quality) still wins downstream when present.
+            var parsed = await _parser.ParseWithInspectionAsync(Path.GetFileName(sourceFile), sourceFile);
 
             // Build destination path (use actual file size for debrid symlink compatibility)
             // Pass download.Quality to preserve quality info from original release title (not re-parsed from downloaded filename)
-            var rootFolder = await GetBestRootFolderAsync(settings, actualFileSize);
+            var rootFolder = await GetRootFolderForLeagueAsync(settings, eventInfo.League, actualFileSize);
             var destinationPath = await BuildDestinationPath(settings, eventInfo, parsed, fileInfo.Extension, rootFolder, sourceFile, download.Part, download.Quality);
 
             _logger.LogInformation("Destination path: {Path}", destinationPath);
@@ -474,6 +540,102 @@ public class FileImportService : IFileImportService
     }
 
     /// <summary>
+    /// <summary>
+    /// Refuse to import any path whose final segment starts with a
+    /// download-client "working folder" prefix (defaults to _UNPACK_ /
+    /// _FAILED_, configurable via Config.DownloadClientWorkingFolders).
+    /// Catches the SABnzbd post-processing-failure case where the
+    /// history reports completed but the folder was renamed to
+    /// _FAILED_<original> with nothing inside. Cheaper than waiting
+    /// for the missing-video-files exception, and crucially throws the
+    /// typed DownloadFailedException so the monitor's catch routes
+    /// straight to Failed without burning the retry budget.
+    /// </summary>
+    private void CheckDownloadClientWorkingFolderPrefix(string downloadPath)
+    {
+        var basename = Path.GetFileName(downloadPath.TrimEnd(Path.DirectorySeparatorChar, '/'));
+        if (string.IsNullOrEmpty(basename)) return;
+
+        // Pull the configured prefix list; fall back to the default if
+        // the user wiped the field. Comma-separated, whitespace-trimmed.
+        var raw = _configService.GetConfigAsync().GetAwaiter().GetResult().DownloadClientWorkingFolders ?? "_UNPACK_,_FAILED_";
+        var prefixes = raw
+            .Split(',', StringSplitOptions.RemoveEmptyEntries)
+            .Select(p => p.Trim())
+            .Where(p => p.Length > 0)
+            .ToList();
+
+        foreach (var prefix in prefixes)
+        {
+            if (basename.StartsWith(prefix, StringComparison.OrdinalIgnoreCase))
+            {
+                throw new DownloadFailedException(
+                    $"Download client marked the folder as failed (prefix '{prefix}' on '{basename}'). " +
+                    "Treating as a failed download — adding the release to the blocklist and triggering a replacement search.");
+            }
+        }
+    }
+
+    /// <summary>
+    /// Scan the download folder for files whose extension matches a
+    /// category the indexer's FailDownloads policy says should fail the
+    /// download. Throws IndexerFailDownloadException on the first match
+    /// (the import path catches it and routes straight to a failed
+    /// download — see EnhancedDownloadMonitorService.HandleCompletedDownload).
+    /// No-op when the indexer has no FailDownloads opinion, or the
+    /// download lacks an IndexerId.
+    /// </summary>
+    private async Task CheckFailDownloadsAsync(DownloadQueueItem download, string downloadPath)
+    {
+        if (download.IndexerId == null) return;
+
+        var indexer = await _db.Indexers.FindAsync(download.IndexerId.Value);
+        if (indexer?.FailDownloads == null || indexer.FailDownloads.Count == 0) return;
+
+        if (!Directory.Exists(downloadPath)) return;
+
+        // Enumerate ALL files (recursively) in the download folder. This
+        // is intentionally agnostic to "is this the main video?" — the
+        // whole point of the policy is to catch fishy companion files
+        // that the regular import would otherwise leave sitting in the
+        // download client's staging area.
+        var files = Directory.EnumerateFiles(downloadPath, "*.*", SearchOption.AllDirectories);
+
+        var rejectedExtensions = indexer.FailDownloads.Contains((int)FailDownloads.UserDefinedExtensions)
+            ? RejectedFileExtensions.ParseUserList((await GetMediaManagementSettingsAsync()).UserRejectedExtensions)
+            : null;
+
+        foreach (var file in files)
+        {
+            var ext = Path.GetExtension(file);
+            if (string.IsNullOrEmpty(ext)) continue;
+
+            if (indexer.FailDownloads.Contains((int)FailDownloads.Executables) &&
+                RejectedFileExtensions.Executables.Contains(ext))
+            {
+                throw new IndexerFailDownloadException(FailDownloads.Executables,
+                    $"Indexer FailDownloads policy: download contains an executable file ({Path.GetFileName(file)}). " +
+                    "Failing the grab and adding the release to the blocklist.");
+            }
+
+            if (indexer.FailDownloads.Contains((int)FailDownloads.PotentiallyDangerous) &&
+                RejectedFileExtensions.Dangerous.Contains(ext))
+            {
+                throw new IndexerFailDownloadException(FailDownloads.PotentiallyDangerous,
+                    $"Indexer FailDownloads policy: download contains a potentially dangerous file ({Path.GetFileName(file)}). " +
+                    "Failing the grab and adding the release to the blocklist.");
+            }
+
+            if (rejectedExtensions != null && rejectedExtensions.Contains(ext))
+            {
+                throw new IndexerFailDownloadException(FailDownloads.UserDefinedExtensions,
+                    $"Indexer FailDownloads policy: download contains a user-rejected file extension ({Path.GetFileName(file)}). " +
+                    "Failing the grab and adding the release to the blocklist.");
+            }
+        }
+    }
+
+    /// <summary>
     /// Find all video files in a directory (or return the file if it's a single file)
     /// </summary>
     private List<string> FindVideoFiles(string path)
@@ -661,11 +823,16 @@ public class FileImportService : IFileImportService
             var effectiveQuality = downloadQuality ?? parsed.Quality ?? "Unknown";
             var effectiveQualityFull = !string.IsNullOrEmpty(downloadQuality) ? downloadQuality : _parser.BuildQualityString(parsed);
 
+            // Filename date tokens use the broadcaster's branding date
+            // (BroadcastDate), not the UTC instant — see FileRenameService
+            // for the rationale.
+            var brandingDate = eventInfo.BroadcastDate ?? eventInfo.EventDate.Date;
+
             var tokens = new FileNamingTokens
             {
                 EventTitle = eventInfo.Title ?? string.Empty,
                 EventTitleThe = eventInfo.Title ?? string.Empty,
-                AirDate = eventInfo.EventDate,
+                AirDate = brandingDate,
                 Quality = effectiveQuality,
                 QualityFull = effectiveQualityFull,
                 ReleaseGroup = parsed.ReleaseGroup ?? string.Empty,
@@ -673,7 +840,7 @@ public class FileImportService : IFileImportService
                 OriginalFilename = Path.GetFileNameWithoutExtension(parsed.EventTitle),
                 // Plex TV show structure
                 Series = eventInfo.League?.Name ?? eventInfo.Sport ?? string.Empty,
-                Season = eventInfo.SeasonNumber?.ToString("0000") ?? eventInfo.Season ?? DateTime.UtcNow.Year.ToString(),
+                Season = eventInfo.SeasonNumber?.ToString("0000") ?? eventInfo.Season ?? brandingDate.Year.ToString(),
                 Episode = episodeNumber.ToString("00"),
                 Part = partSuffix
             };
@@ -1203,7 +1370,44 @@ public class FileImportService : IFileImportService
     /// <summary>
     /// Get best root folder based on free space
     /// </summary>
-    private Task<string> GetBestRootFolderAsync(MediaManagementSettings settings, long fileSize)
+    /// <summary>
+    /// Resolve the root folder a league's media should be written into.
+    /// Prefers the explicit binding stored on the league (set via the Add
+    /// League modal), falling back to the legacy free-space heuristic for
+    /// leagues that were added before the binding existed or whose bound
+    /// root folder has since been removed / become inaccessible.
+    /// </summary>
+    private Task<string> GetRootFolderForLeagueAsync(MediaManagementSettings settings, League? league, long fileSize)
+    {
+        if (settings.RootFolders == null || settings.RootFolders.Count == 0)
+        {
+            throw new Exception("No root folders configured");
+        }
+
+        if (league?.RootFolderId is int boundId)
+        {
+            var bound = settings.RootFolders.FirstOrDefault(rf => rf.Id == boundId);
+            if (bound != null && bound.Accessible)
+            {
+                return Task.FromResult(bound.Path);
+            }
+            // Fall through to the heuristic but log a warning so the user
+            // can spot a misconfigured league instead of having events
+            // silently scatter across other roots.
+            _logger.LogWarning(
+                "[Root Folders] League {LeagueId} ({LeagueName}) is bound to RootFolderId={BoundId} but it's missing or inaccessible — falling back to free-space selection.",
+                league.Id, league.Name, boundId);
+        }
+
+        return Task.FromResult(SelectRootFolderByFreeSpace(settings, fileSize));
+    }
+
+    /// <summary>
+    /// Legacy "biggest disk wins" selection — kept as a fallback for leagues
+    /// without a RootFolderId binding so existing setups keep importing.
+    /// New code should prefer GetRootFolderForLeagueAsync.
+    /// </summary>
+    private string SelectRootFolderByFreeSpace(MediaManagementSettings settings, long fileSize)
     {
         var rootFolders = settings.RootFolders
             .Where(rf => rf.Accessible)
@@ -1215,18 +1419,16 @@ public class FileImportService : IFileImportService
             throw new Exception("No accessible root folders configured");
         }
 
-        // Return first folder with enough space
         var fileSizeMB = fileSize / 1024 / 1024;
         var folder = rootFolders.FirstOrDefault(rf => rf.FreeSpace > fileSizeMB + settings.MinimumFreeSpace);
 
         if (folder == null)
         {
-            // Fall back to folder with most space
             folder = rootFolders.First();
             _logger.LogWarning("No root folder has enough free space, using folder with most space: {Path}", folder.Path);
         }
 
-        return Task.FromResult(folder.Path);
+        return folder.Path;
     }
 
     /// <summary>
@@ -1469,23 +1671,16 @@ public class FileImportService : IFileImportService
         {
             _logger.LogInformation("Loaded {Count} root folders from database", rootFolders.Count);
 
-            // Re-check accessibility for each root folder (important for Docker path mapping changes)
-            foreach (var folder in rootFolders)
+            // Refresh Accessible/FreeSpace/TotalSpace from disk. The columns
+            // are no longer persisted (they only produced drift between row
+            // and reality), so the loaded entities arrive with defaults and
+            // we fill in the live values here.
+            _diskSpaceService.RefreshLiveState(rootFolders);
+
+            foreach (var folder in rootFolders.Where(rf => !rf.Accessible))
             {
-                var wasAccessible = folder.Accessible;
-                folder.Accessible = Directory.Exists(folder.Path);
-
-                if (wasAccessible && !folder.Accessible)
-                {
-                    _logger.LogWarning("Root folder is no longer accessible: {Path}. " +
-                        "If using Docker, check volume mappings match between download client and Sportarr.", folder.Path);
-                }
-                else if (!wasAccessible && folder.Accessible)
-                {
-                    _logger.LogInformation("Root folder is now accessible: {Path}", folder.Path);
-                }
-
-                _logger.LogDebug("Root folder: {Path} - Accessible: {Accessible}", folder.Path, folder.Accessible);
+                _logger.LogWarning("Root folder is not accessible: {Path}. " +
+                    "If using Docker, check volume mappings match between download client and Sportarr.", folder.Path);
             }
 
             var accessibleCount = rootFolders.Count(rf => rf.Accessible);

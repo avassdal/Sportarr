@@ -34,12 +34,30 @@ const BackupPage: React.FC = () => {
     fetchBackups();
   }, []);
 
+  // Pull the most useful message out of an error response. The
+  // backend's Results.Problem returns ProblemDetails JSON with
+  // { title, detail, status } — surfacing detail (or title) gives
+  // the user something actionable like "Backup folder not writable"
+  // instead of the previous generic "Failed to fetch backups".
+  const extractError = async (response: Response, fallback: string): Promise<string> => {
+    try {
+      const data = await response.json();
+      if (typeof data === 'object' && data) {
+        if (typeof data.detail === 'string' && data.detail.length > 0) return data.detail;
+        if (typeof data.title === 'string' && data.title.length > 0) return data.title;
+        if (typeof data.error === 'string' && data.error.length > 0) return data.error;
+        if (typeof data.message === 'string' && data.message.length > 0) return data.message;
+      }
+    } catch { /* not JSON, ignore */ }
+    return `${fallback} (HTTP ${response.status})`;
+  };
+
   const fetchBackups = async () => {
     setLoading(true);
     setError(null);
     try {
       const response = await apiGet('/api/system/backup');
-      if (!response.ok) throw new Error('Failed to fetch backups');
+      if (!response.ok) throw new Error(await extractError(response, 'Failed to fetch backups'));
       const data: BackupInfo[] = await response.json();
       setBackups(data);
     } catch (err) {
@@ -58,7 +76,10 @@ const BackupPage: React.FC = () => {
         : '/api/system/backup';
 
       const response = await apiPost(url, {});
-      if (!response.ok) throw new Error('Failed to create backup');
+      if (!response.ok) {
+        const message = await extractError(response, 'Failed to create backup');
+        throw new Error(message);
+      }
 
       setBackupNote('');
       await fetchBackups();
@@ -66,7 +87,9 @@ const BackupPage: React.FC = () => {
         description: 'Backup created successfully!',
       });
     } catch (err) {
-      setError(err instanceof Error ? err.message : 'Failed to create backup');
+      const message = err instanceof Error ? err.message : 'Failed to create backup';
+      setError(message);
+      toast.error('Backup Failed', { description: message });
     } finally {
       setCreating(false);
     }

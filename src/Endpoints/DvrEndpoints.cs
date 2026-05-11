@@ -129,6 +129,14 @@ app.MapPost("/api/dvr/recordings", async (ScheduleDvrRecordingRequest request, D
     {
         return Results.BadRequest(new { error = ex.Message });
     }
+    catch (InvalidOperationException ex)
+    {
+        // Conflict-policy=Refuse fires this when MaxStreams or
+        // DvrMaxConcurrentRecordings would be exceeded. 409 lets
+        // the UI render a "conflict" state distinct from generic
+        // 4xx so the user can choose to override.
+        return Results.Conflict(new { error = ex.Message });
+    }
 }).WithRequestValidation<ScheduleDvrRecordingRequest>();
 
 // Update a scheduled recording
@@ -245,6 +253,44 @@ app.MapPost("/api/events/{eventId:int}/dvr/cancel", async (int eventId, EventDvr
 {
     await eventDvrService.CancelRecordingsForEventAsync(eventId);
     return Results.Ok(new { success = true });
+});
+
+// iptv-org canonical channel matching. The database is a public
+// metadata catalog (Unlicense / CC0) of every TV channel in the
+// world keyed by stable "Name.cc" ids. We don't pull their stream
+// lists - the user always provides M3U sources - we only use the
+// catalog to resolve display name/logo/country and to anchor
+// channel identity across provider rebrands.
+app.MapPost("/api/iptv/iptv-org/refresh", async (
+    IptvOrgSyncService svc,
+    CancellationToken ct) =>
+{
+    var count = await svc.RefreshCacheAsync(ct);
+    return Results.Ok(new { success = true, canonicalChannelCount = count });
+});
+
+app.MapPost("/api/iptv/iptv-org/match", async (
+    IptvOrgSyncService svc,
+    bool? overwrite,
+    CancellationToken ct) =>
+{
+    var updated = await svc.MatchUserChannelsAsync(overwriteHighConfidence: overwrite ?? false, ct);
+    return Results.Ok(new { success = true, channelsUpdated = updated });
+});
+
+// List candidate IPTV channels for an event ranked by confidence,
+// blending the metadata API's broadcast assertion (Event.Broadcast)
+// with the user's existing channel-league mappings and country
+// hints. Frontend uses this to render "Auto-record on..." pickers
+// and to surface match-quality warnings before an unattended
+// recording fires.
+app.MapGet("/api/events/{eventId:int}/channels/candidates", async (
+    int eventId,
+    EventChannelResolverService resolver,
+    CancellationToken ct) =>
+{
+    var ranked = await resolver.ResolveAsync(eventId, ct);
+    return Results.Ok(new { eventId, candidates = ranked });
 });
 
 // Import a completed DVR recording to the event library
@@ -412,6 +458,7 @@ app.MapGet("/api/dvr/settings", async (ConfigService configService) =>
         prePaddingMinutes = config.DvrPrePaddingMinutes,
         postPaddingMinutes = config.DvrPostPaddingMinutes,
         maxConcurrentRecordings = config.DvrMaxConcurrentRecordings,
+        conflictPolicy = config.DvrConflictPolicy,
         deleteAfterImport = config.DvrDeleteAfterImport,
         recordingRetentionDays = config.DvrRecordingRetentionDays,
         hardwareAcceleration = config.DvrHardwareAcceleration,
@@ -450,6 +497,17 @@ app.MapPut("/api/dvr/settings", async (HttpRequest request, ConfigService config
         config.DvrPostPaddingMinutes = postPadding.GetInt32();
     if (settings.TryGetProperty("maxConcurrentRecordings", out var maxConcurrent))
         config.DvrMaxConcurrentRecordings = maxConcurrent.GetInt32();
+    if (settings.TryGetProperty("conflictPolicy", out var conflictPolicyJson))
+    {
+        var v = conflictPolicyJson.GetString();
+        // Whitelist - reject unknown policy strings to keep the
+        // service-side switch deterministic.
+        config.DvrConflictPolicy = v switch
+        {
+            "Refuse" or "Queue" or "Preempt" => v!,
+            _ => "Refuse"
+        };
+    }
     if (settings.TryGetProperty("deleteAfterImport", out var deleteAfter))
         config.DvrDeleteAfterImport = deleteAfter.GetBoolean();
     if (settings.TryGetProperty("recordingRetentionDays", out var retention))

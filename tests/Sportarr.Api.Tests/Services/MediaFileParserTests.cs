@@ -264,4 +264,176 @@ public class MediaFileParserTests
         // Assert
         result.Should().NotBeNull();
     }
+
+    // ============================================================
+    // Layer A: QualityParser fallback regression tests
+    // Filenames where the primary MediaFileParser regex returns null
+    // and the QualityParser fallback fills in the gap so files don't
+    // end up as Unknown quality on import.
+    // ============================================================
+
+    [Theory]
+    [InlineData("EPL.2026.05.02.Match.1920x1080.x264", "1080P")]
+    [InlineData("Event.3840x2160.HEVC", "2160P")]
+    [InlineData("Game.1280x720.x264", "720P")]
+    public void Parse_ShouldExtractResolutionFromBareDimensions(string filename, string expectedResolution)
+    {
+        // Filenames with only the dimension form (no "1080p" / "720p" tokens)
+        // would have returned null from the legacy regex; the QualityParser
+        // fallback now catches them.
+        var result = _parser.Parse(filename);
+
+        result.Resolution.Should().Be(expectedResolution);
+    }
+
+    [Fact]
+    public void Parse_ShouldExtractWebSource_WhenOnlyAmazonBrandedWebTokenPresent()
+    {
+        // No "WEB-DL" literal, no resolution token. Original regex's "WEB"
+        // alternative would catch it, but only when "WEB" is unambiguous; for
+        // brand-tagged variants like "Amazon.WEB" the QualityParser fallback
+        // is more reliable.
+        var result = _parser.Parse("EPL.match.Amazon.WEB.1080p.x264-GROUP");
+
+        result.Source.Should().BeOneOf("WEBDL", "WEB");
+    }
+
+    // ============================================================
+    // Layer B: Extension fallback regression tests
+    // Filename has no quality keywords but the container extension is
+    // itself a strong signal — .ts -> RAWHD (1080p HDTV bucket),
+    // .iso/.bdmv -> Bluray-1080p, .avi/.wmv -> SDTV.
+    // ============================================================
+
+    [Theory]
+    [InlineData("recording.ts", "1080P", "HDTV")]
+    [InlineData("game.m2ts", "1080P", "HDTV")]
+    public void Parse_ShouldFallBackToTsExtensionAsRawhd(string filename, string expectedRes, string expectedSource)
+    {
+        // QualityParser.ParseQualityFromExtension returns Quality.RAWHD for
+        // .ts/.m2ts. RAWHD maps to (TelevisionRaw, R1080p), and our verbose
+        // mapper bucket-aliases TelevisionRaw to "HDTV" so the resulting
+        // Quality string is "1080P HDTV".
+        var result = _parser.Parse(filename);
+
+        result.Resolution.Should().Be(expectedRes);
+        result.Source.Should().Be(expectedSource);
+    }
+
+    [Theory]
+    [InlineData("disc.iso", "1080P", "BLURAY")]
+    [InlineData("BACKUP.bdmv", "1080P", "BLURAY")]
+    public void Parse_ShouldFallBackToDiscExtensionAsBluray(string filename, string expectedRes, string expectedSource)
+    {
+        // .iso / .bdmv are nearly always BluRay rips at 1080p — safer default
+        // than guessing 2160p, matches Sonarr's extension hint behavior.
+        var result = _parser.Parse(filename);
+
+        result.Resolution.Should().Be(expectedRes);
+        result.Source.Should().Be(expectedSource);
+    }
+
+    [Theory]
+    [InlineData("oldcap.avi")]
+    [InlineData("legacy.wmv")]
+    [InlineData("ancient.flv")]
+    public void Parse_ShouldFallBackToLegacySdContainers(string filename)
+    {
+        // SDTV (R480p, Television) maps to "480P" + "HDTV" in verbose form.
+        var result = _parser.Parse(filename);
+
+        result.Resolution.Should().Be("480P");
+        result.Source.Should().Be("HDTV");
+    }
+
+    [Fact]
+    public void Parse_ShouldStillReturnUnknown_WhenNoSignalAtAll()
+    {
+        // .mkv has no extension hint defined, and a name with no tokens has
+        // nothing for any tier to latch onto. The third tier (ffprobe) is the
+        // last-resort augmenter and only runs via ParseWithInspectionAsync
+        // with a real file path — covered separately.
+        var result = _parser.Parse("randomname.mkv");
+
+        result.Resolution.Should().BeNull();
+        result.Source.Should().BeNull();
+    }
+
+    // ============================================================
+    // Layer C: ParseWithInspectionAsync pipeline behavior
+    // The inspector is optional. Without it, the method must degrade
+    // gracefully and just return the regex-only Parse() result.
+    // ============================================================
+
+    [Fact]
+    public async Task ParseWithInspectionAsync_ShouldReturnRegexResultWhenFilePathNull()
+    {
+        // No file path => no ffprobe call. Result must equal Parse(filename).
+        var result = await _parser.ParseWithInspectionAsync(
+            "EPL.2026.05.02.Match.1080p.WEB-DL.x264-GROUP",
+            filePath: null);
+
+        result.Resolution.Should().Be("1080P");
+        result.Source.Should().Be("WEBDL");
+    }
+
+    [Fact]
+    public async Task ParseWithInspectionAsync_ShouldReturnRegexResultWhenFilePathDoesNotExist()
+    {
+        // Non-existent path => the inspector is checked, returns null, and the
+        // method gracefully degrades to Parse() output. No exception thrown.
+        var result = await _parser.ParseWithInspectionAsync(
+            "EPL.2026.05.02.Match.1080p.WEB-DL.x264-GROUP",
+            filePath: "/non/existent/path.mkv");
+
+        result.Resolution.Should().Be("1080P");
+        result.Source.Should().Be("WEBDL");
+    }
+
+    [Fact]
+    public async Task ParseWithInspectionAsync_ShouldNotThrow_WhenFilenameYieldsNothing()
+    {
+        // No regex hit, no file path — nothing for any tier to latch onto.
+        // Must complete without throwing and just return whatever the regex
+        // tier produced (Unknown / null).
+        var result = await _parser.ParseWithInspectionAsync("randomname.mkv", filePath: null);
+
+        result.Should().NotBeNull();
+    }
+
+    // ============================================================
+    // Release-group rejection: trailing tokens that are actually
+    // quality / resolution / source / codec markers must NOT be
+    // returned as the release group. The naive regex captures the
+    // last "-XXX" run, so files like "Show.WEBDL-2160p" fall through
+    // to "2160p" without these guards.
+    // ============================================================
+
+    [Theory]
+    [InlineData("Formula 1 - S2015E03 - Malaysian Grand Prix Qualifying - WEBDL-2160p")]
+    [InlineData("EPL.match.1080p.WEB-DL")]
+    [InlineData("Show.S01E01.HDTV-720p")]
+    [InlineData("Game.S2025E01.BluRay-2160p")]
+    [InlineData("Show.S01E01.x265")]
+    [InlineData("Show.S01E01.HEVC")]
+    [InlineData("Show.S01E01.AAC")]
+    public void Parse_ShouldNotReturnQualityTokenAsReleaseGroup(string filename)
+    {
+        var result = _parser.Parse(filename);
+
+        result.ReleaseGroup.Should().BeNull(
+            because: "trailing quality / resolution / codec / audio tokens are not release groups");
+    }
+
+    [Theory]
+    [InlineData("EPL.2026.05.02.Arsenal.vs.Fulham.1080p.WEB.H264-BILLIE", "BILLIE")]
+    [InlineData("UFC.300.2024.04.13.1080p.WEB-DL.x264-DARKSPORT", "DARKSPORT")]
+    [InlineData("Show.S01E01.1080p.WEB.x264-NTb", "NTb")]
+    [InlineData("Game.S2025E01.WEBDL-1080p-FLUX", "FLUX")]
+    public void Parse_ShouldExtractGenuineReleaseGroups(string filename, string expectedGroup)
+    {
+        var result = _parser.Parse(filename);
+
+        result.ReleaseGroup.Should().Be(expectedGroup);
+    }
 }

@@ -48,6 +48,7 @@ public class SportDetectionTests
             null,
             null,
             null,
+            null,
             null);
     }
 

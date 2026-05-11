@@ -5,6 +5,16 @@ namespace Sportarr.Api.Models;
 /// <summary>
 /// DVR quality profile for controlling recording encoding settings.
 /// Determines how streams are recorded - either direct copy or transcoded.
+///
+/// IMPORTANT: This type is still used as a value object by
+/// FFmpegRecorderService and DvrQualityScoreCalculator (it carries
+/// codec/CRF/preset/bitrate fields). The DvrQualityProfiles *table*
+/// is unused - DVR encoding settings live on Config now and are
+/// projected into a synthetic DvrQualityProfile via DvrEndpoints
+/// before being passed to the recorder. The DbSet on
+/// SportarrDbContext is retained so legacy data isn't dropped, but
+/// nothing reads or writes it. A future cleanup migration may drop
+/// the table once we're confident no instance still has rows there.
 /// </summary>
 public class DvrQualityProfile
 {

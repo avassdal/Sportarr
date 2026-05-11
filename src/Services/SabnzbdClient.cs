@@ -597,18 +597,66 @@ public class SabnzbdClient
                     };
                 }
 
-                // Handle failed downloads - distinguish between download failures and post-processing failures
+                // Handle failed downloads. Three buckets:
+                //  - Repair failure (par2/blocks): files are incomplete,
+                //    real failure, no usable data on disk.
+                //  - Unpack/move failure: SAB couldn't extract the archive
+                //    or move the result, so the destination folder is
+                //    empty (or renamed _FAILED_<x>). Real failure — was
+                //    previously misclassified as a post-processing
+                //    "warning" and import would re-attempt 3× into the
+                //    empty folder, never blocklist, and the next RSS
+                //    sync would re-grab the same broken NZB.
+                //  - Post-processing script failure: download succeeded,
+                //    only the user-script bit failed — files are intact,
+                //    safe to attempt import.
                 if (reportedStatus == "failed")
                 {
                     var failMessage = historyItem.fail_message?.ToLowerInvariant() ?? "";
 
-                    // CRITICAL: Repair failures are REAL failures - do NOT import these
-                    // PAR2 repair fails when there aren't enough recovery blocks to reconstruct missing data
-                    // The files are incomplete/corrupted and should NOT be imported
                     var isRepairFailure =
                         failMessage.Contains("repair") ||
                         failMessage.Contains("par2") ||
                         failMessage.Contains("blocks");
+
+                    var isUnpackOrMoveFailure =
+                        failMessage.Contains("unpacking failed") ||
+                        failMessage.Contains("unpack failed") ||
+                        failMessage.Contains("moving failed");
+
+                    // Script failure is a narrow category: ONLY when SAB
+                    // says the user-configured post-processing script
+                    // failed but the download itself completed cleanly.
+                    // The previous heuristic matched any message
+                    // containing "aborted", which silently captured
+                    // SAB's own "Aborted, cannot be completed" message
+                    // (which means articles missing from the provider -
+                    // a real failure, no usable data on disk).
+                    //
+                    // Two-layer defense:
+                    //   1. Match unambiguous user-script phrases.
+                    //   2. Storage path must be populated and NOT
+                    //      under /incomplete/. SAB writes the
+                    //      release path into historyItem.storage when
+                    //      unpacking succeeded; for real aborts it
+                    //      stays under incomplete/ or is empty. Even
+                    //      if a future SAB version uses a phrase that
+                    //      matches our script-failure list for a real
+                    //      abort, the storage gate blocks the
+                    //      misclassification.
+                    var hasUsableStorage =
+                        !string.IsNullOrEmpty(historyItem.storage) &&
+                        historyItem.storage.IndexOf("/incomplete/", StringComparison.OrdinalIgnoreCase) < 0 &&
+                        historyItem.storage.IndexOf("\\incomplete\\", StringComparison.OrdinalIgnoreCase) < 0;
+
+                    var isPostProcessingScriptFailure =
+                        !isRepairFailure && !isUnpackOrMoveFailure &&
+                        hasUsableStorage &&
+                        (failMessage.Contains("post-processing script") ||
+                         failMessage.Contains("post processing script") ||
+                         failMessage.Contains("user script") ||
+                         failMessage.Contains("script failed") ||
+                         failMessage.Contains("script error"));
 
                     if (isRepairFailure)
                     {
@@ -617,32 +665,29 @@ public class SabnzbdClient
                         status = "failed";
                         errorMessage = historyItem.fail_message ?? "Repair failed - files are incomplete";
                     }
+                    else if (isUnpackOrMoveFailure)
+                    {
+                        _logger.LogError("[SABnzbd] Download {NzoId} UNPACK/MOVE FAILED: {FailMessage}. Destination folder is empty - NOT importing.",
+                            nzoId, historyItem.fail_message);
+                        status = "failed";
+                        errorMessage = historyItem.fail_message ?? "Unpack failed - no files to import";
+                    }
+                    else if (isPostProcessingScriptFailure)
+                    {
+                        // Only the user post-processing script failed —
+                        // the actual download + unpack succeeded, so the
+                        // files are sitting in the destination intact.
+                        _logger.LogWarning("[SABnzbd] Download {NzoId} completed but post-processing script failed: {FailMessage}. Will attempt import anyway.",
+                            nzoId, historyItem.fail_message);
+                        status = "completed";
+                        errorMessage = $"Post-processing warning: {historyItem.fail_message}";
+                    }
                     else
                     {
-                        // Post-processing script failures should not prevent import.
-                        // SABnzbd marks download as "failed" even if download succeeded but post-processing script failed
-                        var isPostProcessingFailure =
-                            failMessage.Contains("post") ||
-                            failMessage.Contains("script") ||
-                            failMessage.Contains("aborted") ||
-                            failMessage.Contains("moving failed") ||
-                            failMessage.Contains("unpacking failed");
-
-                        if (isPostProcessingFailure)
-                        {
-                            // Download succeeded, only post-processing failed - treat as warning, not failure
-                            _logger.LogWarning("[SABnzbd] Download {NzoId} completed but post-processing failed: {FailMessage}. Will attempt import anyway.",
-                                nzoId, historyItem.fail_message);
-                            status = "completed"; // Override to completed so import can proceed
-                            errorMessage = $"Post-processing warning: {historyItem.fail_message}";
-                        }
-                        else
-                        {
-                            // Other download failures (network, missing files on server, etc.)
-                            _logger.LogError("[SABnzbd] Download {NzoId} failed: {FailMessage}", nzoId, historyItem.fail_message);
-                            status = "failed";
-                            errorMessage = historyItem.fail_message ?? "Download failed";
-                        }
+                        // Other download failures (network, missing files on server, etc.)
+                        _logger.LogError("[SABnzbd] Download {NzoId} failed: {FailMessage}", nzoId, historyItem.fail_message);
+                        status = "failed";
+                        errorMessage = historyItem.fail_message ?? "Download failed";
                     }
                 }
 
@@ -694,11 +739,17 @@ public class SabnzbdClient
             // list when the id isn't there), so calling both costs at most one
             // extra HTTP roundtrip and guarantees the entry is gone regardless of
             // which store it lives in.
+            // Both delete URLs need output=json so SABnzbd returns
+            // {"status":true,"nzo_ids":[...]}; without it SAB defaults
+            // to text/plain "ok\n" or HTML, JsonDocument.Parse throws
+            // in DeletionTouched, the catch silently returns false,
+            // and this method warns "neither queue nor history
+            // acknowledged" even when the deletion succeeded.
             var deletedFromAnything = false;
             var mode = deleteFiles ? "delete" : "remove";
             var delFilesParam = deleteFiles ? "&del_files=1" : "";
 
-            var queueResponse = await SendApiRequestAsync(config, $"?mode=queue&name={mode}&value={nzoId}{delFilesParam}");
+            var queueResponse = await SendApiRequestAsync(config, $"?mode=queue&name={mode}&value={nzoId}{delFilesParam}&output=json");
             if (DeletionTouched(queueResponse, nzoId))
             {
                 _logger.LogInformation("[SABnzbd] Removed {NzoId} from queue", nzoId);
@@ -706,11 +757,12 @@ public class SabnzbdClient
             }
             else
             {
-                _logger.LogDebug("[SABnzbd] Queue delete reported no change for {NzoId} (likely already in history)", nzoId);
+                _logger.LogDebug("[SABnzbd] Queue delete reported no change for {NzoId} (likely already in history). Raw response: {Response}",
+                    nzoId, TruncateForLog(queueResponse));
             }
 
             var historyDelFilesParam = deleteFiles ? "&del_files=1" : "";
-            var historyResponse = await SendApiRequestAsync(config, $"?mode=history&name=delete&value={nzoId}{historyDelFilesParam}");
+            var historyResponse = await SendApiRequestAsync(config, $"?mode=history&name=delete&value={nzoId}{historyDelFilesParam}&output=json");
             if (DeletionTouched(historyResponse, nzoId))
             {
                 _logger.LogInformation("[SABnzbd] Removed {NzoId} from history", nzoId);
@@ -718,12 +770,18 @@ public class SabnzbdClient
             }
             else
             {
-                _logger.LogDebug("[SABnzbd] History delete reported no change for {NzoId}", nzoId);
+                _logger.LogDebug("[SABnzbd] History delete reported no change for {NzoId}. Raw response: {Response}",
+                    nzoId, TruncateForLog(historyResponse));
             }
 
             if (!deletedFromAnything)
             {
-                _logger.LogWarning("[SABnzbd] Neither queue nor history acknowledged deletion of {NzoId} — already gone, or SABnzbd did not return the id in nzo_ids", nzoId);
+                // Log the raw bodies when the warning fires - this is
+                // the only diagnostic we'll have if SAB returns
+                // something unexpected. Capped at 500 chars per body.
+                _logger.LogWarning(
+                    "[SABnzbd] Neither queue nor history acknowledged deletion of {NzoId} - already gone, or SAB returned an unexpected shape. queue={Queue} history={History}",
+                    nzoId, TruncateForLog(queueResponse), TruncateForLog(historyResponse));
             }
 
             return deletedFromAnything;
@@ -742,6 +800,20 @@ public class SabnzbdClient
     /// matching to remove. Returns true only when the requested id appears
     /// in the returned list.
     /// </summary>
+    /// <summary>
+    /// Truncate a response body for log output. Keeps the head of
+    /// any unexpected response (HTML error page, plain "ok", whatever
+    /// SAB version-specific quirk) so we have something to diagnose
+    /// against when the deletion-not-acknowledged warning fires.
+    /// </summary>
+    private static string TruncateForLog(string? response)
+    {
+        if (string.IsNullOrEmpty(response)) return "(empty)";
+        const int maxLen = 500;
+        var trimmed = response.Trim();
+        return trimmed.Length <= maxLen ? trimmed : trimmed.Substring(0, maxLen) + "...";
+    }
+
     private static bool DeletionTouched(string? response, string nzoId)
     {
         if (string.IsNullOrEmpty(response)) return false;
@@ -750,14 +822,38 @@ public class SabnzbdClient
             using var doc = JsonDocument.Parse(response);
             var root = doc.RootElement;
             if (!root.TryGetProperty("status", out var statusProp) || !statusProp.GetBoolean()) return false;
-            if (!root.TryGetProperty("nzo_ids", out var idsProp) || idsProp.ValueKind != JsonValueKind.Array) return false;
+
+            // SABnzbd's history-delete reliably returns status:true on
+            // success but the shape of nzo_ids varies by version: some
+            // versions return ["nzo_id"], some return [], and some
+            // omit the field entirely. Previously we required the id
+            // to appear in the array, which rejected legitimate
+            // single-id history-delete successes from any SAB build
+            // that omits/empties the array (warning fired after every
+            // import despite SAB having actually performed the
+            // delete). Treat status:true as authoritative success;
+            // when nzo_ids IS present we still verify the id appears
+            // in it so a delete that affected something else doesn't
+            // get counted.
+            if (!root.TryGetProperty("nzo_ids", out var idsProp) || idsProp.ValueKind != JsonValueKind.Array)
+                return true;
+
+            // Empty array on a status:true response means SAB accepted
+            // the request and either removed nothing or simply didn't
+            // echo the list. Trust status:true here too - the
+            // alternative is the spurious-warning regression noted
+            // above.
+            var any = false;
             foreach (var idElement in idsProp.EnumerateArray())
             {
+                any = true;
                 var s = idElement.GetString();
                 if (!string.IsNullOrEmpty(s) && string.Equals(s, nzoId, StringComparison.OrdinalIgnoreCase))
                     return true;
             }
-            return false;
+            // Array was non-empty but our id wasn't in it - the delete
+            // touched a different record. Treat as not-our-success.
+            return !any;
         }
         catch
         {

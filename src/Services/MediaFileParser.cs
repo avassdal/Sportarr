@@ -9,6 +9,7 @@ namespace Sportarr.Api.Services;
 public class MediaFileParser
 {
     private readonly ILogger<MediaFileParser> _logger;
+    private readonly MediaFileInspector? _inspector;
 
     // Quality patterns
     private static readonly Regex QualityPattern = new(@"(?<quality>2160p|1080p|720p|480p|360p|4K|UHD|HD|SD)", RegexOptions.IgnoreCase | RegexOptions.Compiled);
@@ -24,23 +25,93 @@ public class MediaFileParser
     private static readonly Regex DatePattern = new(@"(?<year>\d{4})[-.]?(?<month>\d{2})[-.]?(?<day>\d{2})", RegexOptions.Compiled);
     private static readonly Regex YearPattern = new(@"\b(?<year>19\d{2}|20\d{2})\b", RegexOptions.Compiled);
 
-    public MediaFileParser(ILogger<MediaFileParser> logger)
+    public MediaFileParser(ILogger<MediaFileParser> logger, MediaFileInspector? inspector = null)
     {
         _logger = logger;
+        _inspector = inspector;
     }
 
     /// <summary>
-    /// Parse a filename or release title to extract metadata
+    /// Parse a filename and augment with ffprobe inspection of the file's
+    /// actual binary metadata. Sonarr-parity behavior — ffprobe always runs
+    /// when a real on-disk path is supplied, not just as a fallback when
+    /// filename parsing came up short. The merge logic only fills fields the
+    /// filename left null, so an informative release name still wins for
+    /// Resolution / Source while ffprobe fills the codec and audio-language
+    /// tags that release names rarely include.
+    /// </summary>
+    public async Task<ParsedFileInfo> ParseWithInspectionAsync(
+        string filename,
+        string? filePath,
+        CancellationToken cancellationToken = default)
+    {
+        var parsed = Parse(filename);
+
+        if (_inspector == null || string.IsNullOrEmpty(filePath) || !File.Exists(filePath))
+            return parsed;
+
+        var probed = await _inspector.InspectAsync(filePath, cancellationToken);
+        if (probed == null) return parsed;
+
+        var augmented = false;
+        if (string.IsNullOrEmpty(parsed.Resolution) && !string.IsNullOrEmpty(probed.Resolution))
+        {
+            parsed.Resolution = probed.Resolution;
+            augmented = true;
+        }
+        if (string.IsNullOrEmpty(parsed.Source) && !string.IsNullOrEmpty(probed.Source))
+        {
+            parsed.Source = probed.Source;
+            augmented = true;
+        }
+        if (string.IsNullOrEmpty(parsed.VideoCodec) && !string.IsNullOrEmpty(probed.VideoCodec))
+            parsed.VideoCodec = probed.VideoCodec;
+        if (string.IsNullOrEmpty(parsed.AudioCodec) && !string.IsNullOrEmpty(probed.AudioCodec))
+            parsed.AudioCodec = probed.AudioCodec;
+
+        // ffprobe also gives us the audio-stream language tags. Surface them
+        // separately on ParsedFileInfo so the import flow can pre-fill the
+        // Languages chip-list in the metadata editor.
+        if (probed.Languages != null && probed.Languages.Count > 0)
+        {
+            foreach (var lang in probed.Languages)
+            {
+                if (!string.IsNullOrWhiteSpace(lang) &&
+                    !parsed.DetectedLanguages.Contains(lang, StringComparer.OrdinalIgnoreCase))
+                {
+                    parsed.DetectedLanguages.Add(lang);
+                }
+            }
+        }
+
+        if (augmented)
+        {
+            parsed.Quality = BuildQualityFromParts(parsed.Resolution, parsed.Source);
+            _logger.LogInformation("[MediaInfo] ffprobe augmented '{File}' -> Resolution={Res}, Source={Src}, VideoCodec={VC}",
+                Path.GetFileName(filePath), parsed.Resolution ?? "?", parsed.Source ?? "?", parsed.VideoCodec ?? "?");
+        }
+
+        return parsed;
+    }
+
+    /// <summary>
+    /// Parse a filename or release title to extract metadata.
+    /// Two-tier resolution/source detection: this class's regex first, then the
+    /// richer QualityParser as a fallback. The fallback is what catches
+    /// dimension-form ("1920x1080"), bracketed ("[4K]"), and source variants
+    /// (BDRip, BRRip, AHDTV-via-HDTV, brand-tagged WEB-DL like "Amazon.WEB").
     /// </summary>
     public ParsedFileInfo Parse(string filename)
     {
         // Remove actual file extensions (.mkv, .mp4, etc.) but preserve release names
         var originalName = filename;
-        var knownExtensions = new[] { ".mkv", ".mp4", ".avi", ".m4v", ".ts", ".wmv", ".mpg", ".mpeg" };
+        string? capturedExtension = null;
+        var knownExtensions = new[] { ".mkv", ".mp4", ".avi", ".m4v", ".ts", ".m2ts", ".mts", ".wmv", ".mpg", ".mpeg", ".iso", ".bdmv", ".img", ".vob", ".flv" };
         foreach (var ext in knownExtensions)
         {
             if (filename.EndsWith(ext, StringComparison.OrdinalIgnoreCase))
             {
+                capturedExtension = ext;
                 originalName = filename.Substring(0, filename.Length - ext.Length);
                 break;
             }
@@ -49,15 +120,43 @@ public class MediaFileParser
         // Clean filename for other patterns
         var cleanName = CleanFilename(originalName);
 
+        var resolution = ExtractResolution(cleanName);
+        var source = ExtractSource(cleanName);
+
+        // Fallback tier 1: when this class's regex came up empty, ask the richer
+        // QualityParser to take a swing. Only fills in values that are missing,
+        // so existing test contracts (uppercase resolution, normalized source
+        // names) are preserved for filenames the primary regex already handles.
+        if (resolution == null || source == null)
+        {
+            var fallback = QualityParser.ParseQuality(cleanName);
+            resolution ??= MapResolutionToVerbose(fallback.Quality.Resolution);
+            source ??= MapSourceToVerbose(fallback.Quality.Source);
+        }
+
+        // Fallback tier 2: extension hint. Catches .ts (RAWHD), .iso/.bdmv (BluRay
+        // 1080p), and legacy SD containers when the filename body has no usable
+        // tokens. Skipped if either dimension is already known to avoid overwriting
+        // a strong filename signal with a weaker container hint.
+        if ((resolution == null || source == null) && capturedExtension != null)
+        {
+            var extQuality = QualityParser.ParseQualityFromExtension(capturedExtension);
+            if (extQuality.Id != 0) // not Unknown
+            {
+                resolution ??= MapResolutionToVerbose(extQuality.Resolution);
+                source ??= MapSourceToVerbose(extQuality.Source);
+            }
+        }
+
         var parsed = new ParsedFileInfo
         {
             EventTitle = ExtractEventTitle(cleanName),
-            Quality = ExtractQuality(cleanName),
+            Quality = BuildQualityFromParts(resolution, source),
             ReleaseGroup = ExtractReleaseGroup(originalName), // Use original for release group
-            Resolution = ExtractResolution(cleanName),
+            Resolution = resolution,
             VideoCodec = ExtractVideoCodec(cleanName),
             AudioCodec = ExtractAudioCodec(cleanName),
-            Source = ExtractSource(cleanName),
+            Source = source,
             AirDate = ExtractAirDate(originalName), // Use original for date parsing
             Edition = ExtractEdition(cleanName),
             Language = ExtractLanguage(cleanName),
@@ -68,6 +167,46 @@ public class MediaFileParser
             filename, parsed.EventTitle, parsed.Quality, parsed.ReleaseGroup);
 
         return parsed;
+    }
+
+    private static string? BuildQualityFromParts(string? resolution, string? source)
+    {
+        if (!string.IsNullOrEmpty(resolution) && !string.IsNullOrEmpty(source))
+            return $"{resolution} {source}";
+        if (!string.IsNullOrEmpty(resolution))
+            return resolution;
+        if (!string.IsNullOrEmpty(source))
+            return source;
+        return null;
+    }
+
+    private static string? MapResolutionToVerbose(QualityParser.Resolution res)
+    {
+        return res switch
+        {
+            QualityParser.Resolution.R2160p => "2160P",
+            QualityParser.Resolution.R1080p => "1080P",
+            QualityParser.Resolution.R720p => "720P",
+            QualityParser.Resolution.R576p => "576P",
+            QualityParser.Resolution.R540p => "540P",
+            QualityParser.Resolution.R480p => "480P",
+            QualityParser.Resolution.R360p => "360P",
+            _ => null
+        };
+    }
+
+    private static string? MapSourceToVerbose(QualityParser.QualitySource src)
+    {
+        return src switch
+        {
+            QualityParser.QualitySource.Bluray or QualityParser.QualitySource.BlurayRaw => "BLURAY",
+            QualityParser.QualitySource.Web => "WEBDL",
+            QualityParser.QualitySource.WebRip => "WEBRip",
+            QualityParser.QualitySource.Television or QualityParser.QualitySource.IPTV => "HDTV",
+            QualityParser.QualitySource.TelevisionRaw => "RAWHD",
+            QualityParser.QualitySource.DVD => "DVDRIP",
+            _ => null
+        };
     }
 
     /// <summary>
@@ -147,21 +286,6 @@ public class MediaFileParser
         return cleanName.Trim();
     }
 
-    private string? ExtractQuality(string cleanName)
-    {
-        var resolution = ExtractResolution(cleanName);
-        var source = ExtractSource(cleanName);
-
-        if (!string.IsNullOrEmpty(resolution) && !string.IsNullOrEmpty(source))
-            return $"{resolution} {source}";
-        if (!string.IsNullOrEmpty(resolution))
-            return resolution;
-        if (!string.IsNullOrEmpty(source))
-            return source;
-
-        return null;
-    }
-
     private string? ExtractResolution(string cleanName)
     {
         var match = QualityPattern.Match(cleanName);
@@ -232,12 +356,50 @@ public class MediaFileParser
 
         var group = match.Groups[1].Value;
 
-        // Exclude common quality/source indicators that might be matched
-        var excludedGroups = new[] { "DL", "WEB", "HD", "SD", "UHD" };
-        if (excludedGroups.Contains(group.ToUpper()))
-            return null;
+        // Reject tokens that are actually quality / resolution / source / codec
+        // / audio markers. The trailing "-TOKEN" pattern catches scene-style
+        // group names but also matches "WEBDL-2160p" -> "2160p", which is
+        // never a release group. The legacy DL/WEB/HD/SD/UHD list missed
+        // resolution tokens and codecs entirely.
+        if (LooksLikeQualityToken(group)) return null;
 
         return group;
+    }
+
+    /// <summary>
+    /// Heuristic: does this token look like a quality / resolution / source /
+    /// codec / audio descriptor rather than a release-group name? Used to
+    /// short-circuit the trailing-hyphen release-group regex on filenames
+    /// like "Match.WEBDL-2160p" where the trailing token is technical
+    /// metadata, not a group.
+    /// </summary>
+    private static bool LooksLikeQualityToken(string token)
+    {
+        if (string.IsNullOrEmpty(token)) return true;
+        var t = token.ToUpperInvariant();
+
+        // Resolutions
+        if (Regex.IsMatch(t, @"^(360|480|540|576|720|1080|1440|2160)P?I?$")) return true;
+        // Resolution shorthand
+        if (t is "4K" or "UHD" or "FHD" or "HD" or "SD" or "QHD" or "FULLHD") return true;
+        // Sources
+        if (t is "WEBDL" or "WEB" or "WEBRIP" or "WEBHD" or "WEBCAP" or "WEBMUX"
+            or "BLURAY" or "BLU" or "BD" or "BDRIP" or "BRRIP" or "BDREMUX" or "BDMUX"
+            or "HDDVD"
+            or "HDTV" or "PDTV" or "SDTV" or "DSR" or "TVRIP"
+            or "DVD" or "DVDRIP" or "DVDR" or "DVD5" or "DVD9"
+            or "RAWHD" or "REMUX" or "VHSRIP"
+            or "TS" or "TELESYNC" or "HDCAM" or "CAM" or "TELECINE"
+            or "DL" or "RIP" or "MUX") return true;
+        // Video codecs
+        if (t is "X264" or "X265" or "H264" or "H265" or "HEVC" or "AVC"
+            or "XVID" or "DIVX" or "AV1" or "VP9" or "MPEG2" or "MPEG4") return true;
+        // Audio codecs / channel layouts
+        if (t is "AAC" or "AC3" or "EAC3" or "DD" or "DDP" or "DTS" or "DTSHD" or "DTSMA"
+            or "TRUEHD" or "FLAC" or "MP3" or "OPUS" or "ATMOS"
+            or "5" or "7" or "2") return true;
+
+        return false;
     }
 
     private string? ExtractEdition(string cleanName)

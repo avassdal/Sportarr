@@ -136,6 +136,7 @@ public class RssSyncService : BackgroundService
         var nowUtc = DateTime.UtcNow;
         var monitoredEvents = await db.Events
             .Include(e => e.League)
+            .ThenInclude(l => l!.RootFolder)
             .Include(e => e.HomeTeam)
             .Include(e => e.AwayTeam)
             .Where(e => e.Monitored && e.League != null && e.EventDate <= nowUtc)
@@ -298,6 +299,16 @@ public class RssSyncService : BackgroundService
         Event? bestMatch = null;
         int bestConfidence = int.MinValue;
 
+        // Parse the release title ONCE outside the per-event loop. Without
+        // this, ValidateRelease re-runs the sports-pattern regex chain
+        // against the same string for every monitored event we test,
+        // which becomes O(events × releases) regex work per RSS poll
+        // and floods the log sink (see SportsFileNameParser memoization
+        // for the related symptom). The cached result is read-only at
+        // ValidateRelease's use sites so sharing it across iterations is
+        // safe.
+        var preParsed = matchingService.ParseRelease(release.Title);
+
         foreach (var evt in monitoredEvents)
         {
             // Quick pre-filter: skip events whose title shares no keywords with the release.
@@ -305,7 +316,7 @@ public class RssSyncService : BackgroundService
             if (!eventKeywords.Any(kw => releaseTitle.Contains(kw)))
                 continue;
 
-            var matchResult = matchingService.ValidateRelease(release, evt, null, enableMultiPartEpisodes);
+            var matchResult = matchingService.ValidateRelease(release, evt, null, enableMultiPartEpisodes, preParsed);
             if (!matchResult.IsMatch || matchResult.IsHardRejection)
                 continue;
 
@@ -566,9 +577,23 @@ public class RssSyncService : BackgroundService
 
         if (existingFile != null)
         {
-            // Recalculate quality scores from quality strings (don't trust stored values from old inverted scoring)
-            var existingTotalScore = ReleaseEvaluator.CalculateQualityScoreFromName(existingFile.Quality) + existingFile.CustomFormatScore;
+            // Recalculate quality scores from quality strings (don't trust stored values from old inverted scoring).
+            // CalculateQualityScoreFromName returns 0 for null, empty, "Unknown", or any other unparseable
+            // string, so the gate below covers all three cases in one check.
+            var existingQualityScoreOnly = ReleaseEvaluator.CalculateQualityScoreFromName(existingFile.Quality);
+            var existingTotalScore = existingQualityScoreOnly + existingFile.CustomFormatScore;
             var newTotalScore = ReleaseEvaluator.CalculateQualityScoreFromName(release.Quality) + release.CustomFormatScore;
+
+            // REFUSE-UNKNOWN-UPGRADE GATE: Library imports whose filenames lacked a quality
+            // keyword get persisted with Quality="Unknown" (or null/empty), which scores 0.
+            // Every RSS-discovered release then looks like an upgrade and the event gets
+            // re-downloaded, defeating the user's import. Refuse to auto-upgrade when we
+            // can't classify the existing file. Manual searches go through AutomaticSearchService
+            // directly with isManualSearch=true and bypass this path.
+            if (existingQualityScoreOnly == 0)
+            {
+                return (false, $"Existing file quality is unrecognized ('{existingFile.Quality ?? "null"}'), refusing auto re-download", releasePart);
+            }
 
             if (newTotalScore <= existingTotalScore)
             {
@@ -821,11 +846,16 @@ public class RssSyncService : BackgroundService
         var indexerRecord = await db.Indexers
             .FirstOrDefaultAsync(i => i.Name == release.Indexer, cancellationToken);
 
+        // Per-root override beats the download client's default category.
+        var rssGrabCategory = !string.IsNullOrWhiteSpace(evt.League?.RootFolder?.DefaultDownloadClientCategory)
+            ? evt.League.RootFolder.DefaultDownloadClientCategory!
+            : downloadClient.Category;
+
         // Send to download client with seed config from indexer
         var downloadId = await downloadClientService.AddDownloadAsync(
             downloadClient,
             release.DownloadUrl,
-            downloadClient.Category,
+            rssGrabCategory,
             release.Title,
             indexerRecord?.SeedRatio,
             indexerRecord?.SeedTime

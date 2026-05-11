@@ -217,6 +217,67 @@ public class Indexer
     public bool RejectBlocklistedTorrentHashes { get; set; } = true;
     public int? EarlyReleaseLimit { get; set; }
 
+    // ----------------------------------------------------------------
+    // Plain-RSS indexer fields. Only consulted when Type == IndexerType.Rss.
+    // Modeled after the upstream "Torrent RSS Feed" indexer: search isn't
+    // supported (the feed has no ?q= parameter), so for an Rss-typed
+    // indexer EnableAutomaticSearch/EnableInteractiveSearch are forced
+    // false at insert/update time. The seven parser-config fields below
+    // are filled in by the Test endpoint via auto-detection so the user
+    // doesn't pick the parser flavor manually.
+    // ----------------------------------------------------------------
+
+    /// <summary>Optional cookie string for protected RSS feeds.</summary>
+    public string? Cookie { get; set; }
+
+    /// <summary>
+    /// Treat releases with size = 0 as valid. Useful for feeds that don't
+    /// expose size at all (otherwise every item is rejected during eval).
+    /// </summary>
+    public bool RssAllowZeroSize { get; set; } = false;
+
+    /// <summary>
+    /// Use the ezRSS schema (xmlns="http://xmlns.ezrss.it/0.1/" — provides
+    /// infoHash, contentLength, seeds, magnetURI as first-class elements).
+    /// Set by Test auto-detection when the namespace is found on the feed.
+    /// </summary>
+    public bool RssUseEzrssFormat { get; set; } = false;
+
+    /// <summary>Read the download URL from `<enclosure url="..."/>`.</summary>
+    public bool RssUseEnclosureUrl { get; set; } = true;
+
+    /// <summary>Read the size from `<enclosure length="..."/>`.</summary>
+    public bool RssUseEnclosureLength { get; set; } = true;
+
+    /// <summary>
+    /// Regex-scrape size from `<description>` text (formats like "Size: 4.2 GB").
+    /// </summary>
+    public bool RssParseSizeInDescription { get; set; } = false;
+
+    /// <summary>
+    /// Regex-scrape "Seeder(s): N" / "Leecher(s): N" / "Peer(s): N" from
+    /// `<description>` text. Best-effort — items without a match keep
+    /// MinimumSeeders=null and pass the seeders filter.
+    /// </summary>
+    public bool RssParseSeedersInDescription { get; set; } = false;
+
+    /// <summary>
+    /// Custom XML element name to read size from (e.g. "size" or "Size" —
+    /// some feeds use a non-namespaced bare tag instead of enclosure).
+    /// </summary>
+    [System.ComponentModel.DataAnnotations.MaxLength(50)]
+    public string? RssSizeElementName { get; set; }
+
+    /// <summary>
+    /// Indexer-scoped FailDownloads policy. List of int values from the
+    /// FailDownloads enum (Executables=0, PotentiallyDangerous=1,
+    /// UserDefinedExtensions=2). When the import path detects a file
+    /// in the download folder whose extension matches a category the
+    /// user enabled here, the grab is escalated to a failed download
+    /// (blocklist + retry) instead of being silently warned and skipped.
+    /// </summary>
+    public List<int> FailDownloads { get; set; } = new();
+
     // Download client association
     public int? DownloadClientId { get; set; }
 

@@ -14,17 +14,20 @@ public class FileRenameService
     private readonly FileNamingService _fileNamingService;
     private readonly SportarrApiClient _sportarrApiClient;
     private readonly ILogger<FileRenameService> _logger;
+    private readonly DiskSpaceService _diskSpaceService;
 
     public FileRenameService(
         SportarrDbContext db,
         FileNamingService fileNamingService,
         SportarrApiClient sportarrApiClient,
-        ILogger<FileRenameService> logger)
+        ILogger<FileRenameService> logger,
+        DiskSpaceService diskSpaceService)
     {
         _db = db;
         _fileNamingService = fileNamingService;
         _sportarrApiClient = sportarrApiClient;
         _logger = logger;
+        _diskSpaceService = diskSpaceService;
     }
 
     /// <summary>
@@ -424,11 +427,17 @@ public class FileRenameService
             partSuffix = $" - pt{file.PartNumber}";
         }
 
+        // BroadcastDate is the broadcaster-branding date (e.g. "Monday's
+        // Raw" stays 2026-05-04 even though the UTC instant rolls into
+        // 2026-05-05). Use it for filename tokens; EventDate (UTC) is
+        // only the fallback when the upstream API hasn't supplied one.
+        var brandingDate = evt.BroadcastDate ?? evt.EventDate.Date;
+
         return new FileNamingTokens
         {
             EventTitle = evt.Title,
             Series = evt.League?.Name ?? evt.Sport ?? "Unknown",
-            Season = evt.SeasonNumber?.ToString() ?? evt.Season ?? evt.EventDate.Year.ToString(),
+            Season = evt.SeasonNumber?.ToString() ?? evt.Season ?? brandingDate.Year.ToString(),
             Episode = evt.EpisodeNumber?.ToString() ?? "01",
             Part = partSuffix,
             Quality = file.Quality ?? "Unknown",
@@ -436,7 +445,7 @@ public class FileRenameService
             ReleaseGroup = file.ReleaseGroup ?? ExtractReleaseGroupFromTitle(file.OriginalTitle),
             OriginalTitle = file.OriginalTitle ?? evt.Title,
             OriginalFilename = Path.GetFileNameWithoutExtension(file.FilePath),
-            AirDate = evt.EventDate
+            AirDate = brandingDate
         };
     }
 
@@ -809,24 +818,10 @@ public class FileRenameService
         var rootFolders = await _db.RootFolders.ToListAsync();
         if (rootFolders.Any())
         {
-            // Re-check accessibility for each root folder
-            foreach (var rf in rootFolders)
-            {
-                rf.Accessible = Directory.Exists(rf.Path);
-                if (rf.Accessible)
-                {
-                    try
-                    {
-                        var driveInfo = new DriveInfo(Path.GetPathRoot(rf.Path) ?? rf.Path);
-                        rf.FreeSpace = driveInfo.AvailableFreeSpace;
-                        rf.TotalSpace = driveInfo.TotalSize;
-                    }
-                    catch
-                    {
-                        // Ignore errors getting drive info
-                    }
-                }
-            }
+            // The persisted Accessible/FreeSpace/TotalSpace columns were
+            // dropped — recompute them live before downstream code reads
+            // them. DiskSpaceService handles Docker volume mapping correctly.
+            _diskSpaceService.RefreshLiveState(rootFolders);
 
             settings.RootFolders = rootFolders;
             _logger.LogDebug("[File Rename] Loaded {Count} root folders from database", rootFolders.Count);

@@ -112,10 +112,19 @@ public class EventDvrService
             return existingRecording;
         }
 
-        // Get optimized recording times from EPG (if available)
-        // This uses EPG data to determine accurate start/end times instead of hard-coded duration
-        var prePadding = 5;
-        var postPadding = 30;
+        // Resolve padding from the league override + sport defaults
+        // before falling back to a generic 5/30. NFL games run long
+        // and need ~30min post-roll; soccer matches usually need
+        // ~15. The League can override the sport default.
+        var league = evt.League;
+        var pad = Sportarr.Api.Helpers.DvrPaddingDefaults.Resolve(
+            league?.Sport,
+            league?.DvrPrePadMinutes,
+            league?.DvrPostRollMinutes,
+            fallbackPre: 5,
+            fallbackPost: 30);
+        var prePadding = pad.PrePadMinutes;
+        var postPadding = pad.PostRollMinutes;
         var timeOptimization = await _epgSchedulingService.GetOptimizedRecordingTimesAsync(
             evt, channel, prePadding, postPadding);
 

@@ -131,6 +131,13 @@ public class FileNamingService
             effectiveTitle = matchup;
         }
 
+        // Use BroadcastDate (TZ-anchored) for filename date tokens — that's
+        // the date the broadcaster brands the event by and the date scene
+        // releases use in their filenames. EventDate (UTC) drifts a day for
+        // late-Eastern events and would produce "AEW.2026.01.01.*" for an
+        // episode the world calls "AEW.2025.12.31.*".
+        var brandingDate = eventInfo.BroadcastDate ?? eventInfo.EventDate.Date;
+
         var tokens = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
         {
             { "{Event Title}", effectiveTitle ?? "Unknown Event" },
@@ -145,11 +152,11 @@ public class FileNamingService
             { "{Matchup}", matchup ?? effectiveTitle ?? "Unknown Event" },
             // Plex TV show structure support
             { "{Series}", eventInfo.League?.Name ?? eventInfo.Sport ?? "Unknown" },
-            { "{Season}", eventInfo.SeasonNumber?.ToString("0000") ?? eventInfo.Season ?? eventInfo.EventDate.Year.ToString() },
-            // Date tokens for folder naming
-            { "{Year}", eventInfo.EventDate.Year.ToString() },
-            { "{Month}", eventInfo.EventDate.Month.ToString("00") },
-            { "{Day}", eventInfo.EventDate.Day.ToString("00") },
+            { "{Season}", eventInfo.SeasonNumber?.ToString("0000") ?? eventInfo.Season ?? brandingDate.Year.ToString() },
+            // Date tokens for folder naming (broadcast-local, not UTC)
+            { "{Year}", brandingDate.Year.ToString() },
+            { "{Month}", brandingDate.Month.ToString("00") },
+            { "{Day}", brandingDate.Day.ToString("00") },
             // Episode number for unique identification (handles double headers)
             { "{Episode}", eventInfo.EpisodeNumber?.ToString("00") ?? "01" }
         };

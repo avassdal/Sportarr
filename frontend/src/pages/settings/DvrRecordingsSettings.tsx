@@ -117,6 +117,13 @@ interface DvrSettings {
   prePaddingMinutes: number;
   postPaddingMinutes: number;
   maxConcurrentRecordings: number;
+  // What to do when a new recording would push an IPTV source past
+  // its MaxStreams cap or push past maxConcurrentRecordings.
+  // "Refuse" rejects with 409. "Queue" lets the row sit Scheduled
+  // past its start time until a slot frees. "Preempt" cancels the
+  // lowest-priority overlapping Scheduled row to make room
+  // (active Recording rows are never preempted).
+  conflictPolicy: string;
   deleteAfterImport: boolean;
   recordingRetentionDays: number;
   hardwareAcceleration: number;
@@ -215,6 +222,7 @@ const defaultDvrSettings: DvrSettings = {
   prePaddingMinutes: 5,
   postPaddingMinutes: 30,
   maxConcurrentRecordings: 0,
+  conflictPolicy: 'Refuse',
   deleteAfterImport: false,
   recordingRetentionDays: 0,
   hardwareAcceleration: 99,
@@ -1477,6 +1485,22 @@ export default function DvrRecordingsSettings() {
                       className="w-full px-4 py-2 bg-gray-800 border border-gray-700 rounded-lg text-white focus:outline-none focus:border-red-600"
                     />
                     <p className="text-xs text-gray-500 mt-1">0 = unlimited</p>
+                  </div>
+                  <div>
+                    <label className="block text-sm font-medium text-gray-300 mb-2">When at Recording Limit</label>
+                    <select
+                      value={dvrSettings.conflictPolicy}
+                      onChange={(e) => handleSettingsChange('conflictPolicy', e.target.value)}
+                      className="w-full px-4 py-2 bg-gray-800 border border-gray-700 rounded-lg text-white focus:outline-none focus:border-red-600"
+                    >
+                      <option value="Refuse">Refuse (default - return 409)</option>
+                      <option value="Queue">Queue and start when slot frees</option>
+                      <option value="Preempt">Preempt lowest-priority scheduled</option>
+                    </select>
+                    <p className="text-xs text-gray-500 mt-1">
+                      Applies when an IPTV source's MaxStreams cap or the global cap above is reached.
+                      Active recordings are never preempted.
+                    </p>
                   </div>
                   <div>
                     <label className="block text-sm font-medium text-gray-300 mb-2">Recording Retention (days)</label>

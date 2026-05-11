@@ -1,4 +1,5 @@
 using System.Text.RegularExpressions;
+using Sportarr.Api.Helpers;
 using Sportarr.Api.Models;
 
 namespace Sportarr.Api.Services;
@@ -96,7 +97,25 @@ public class ReleaseMatchingService
     /// <param name="evt">The event to match against</param>
     /// <param name="requestedPart">Optional specific part requested (e.g., "Main Card", "Prelims")</param>
     /// <param name="enableMultiPartEpisodes">Whether multi-part episodes are enabled. When false, rejects releases with detected parts (Main Card, Prelims, etc.)</param>
-    public ReleaseMatchResult ValidateRelease(ReleaseSearchResult release, Event evt, string? requestedPart = null, bool enableMultiPartEpisodes = true)
+    /// <param name="preParsed">Optional pre-parsed result for the release. Callers that match a single release against many events
+    /// (RssSync.FindMatchingEvent and similar) should parse once outside the per-event loop and pass the result here so this method
+    /// doesn't re-run the sports-pattern regex chain on every iteration. When null, this method parses internally — preserves the
+    /// behavior of one-off callers that aren't in a hot loop.</param>
+    /// <summary>
+    /// Parse a release title via the underlying sports filename parser.
+    /// Exposed so callers that match a single release against many
+    /// events (e.g. RssSync.FindMatchingEvent) can parse once outside
+    /// the per-event loop and pass the result into ValidateRelease.
+    /// </summary>
+    public SportsParseResult ParseRelease(string releaseTitle)
+        => _sportsParser.Parse(releaseTitle);
+
+    public ReleaseMatchResult ValidateRelease(
+        ReleaseSearchResult release,
+        Event evt,
+        string? requestedPart = null,
+        bool enableMultiPartEpisodes = true,
+        SportsParseResult? preParsed = null)
     {
         var result = new ReleaseMatchResult
         {
@@ -142,8 +161,10 @@ public class ReleaseMatchingService
             }
         }
 
-        // Parse the release title using sports-specific parser
-        var parseResult = _sportsParser.Parse(release.Title);
+        // Parse the release title using sports-specific parser. Hot-loop
+        // callers pass a pre-parsed result via preParsed so the same
+        // release title isn't re-parsed once per monitored event.
+        var parseResult = preParsed ?? _sportsParser.Parse(release.Title);
 
         // Normalize titles for comparison (includes diacritic removal)
         var normalizedRelease = NormalizeTitle(release.Title);
@@ -371,10 +392,25 @@ public class ReleaseMatchingService
         }
 
         // VALIDATION 4: League/Organization match
+        // Match against the league's canonical name and any of its
+        // alternate names — release groups frequently use the
+        // sponsor-branded form (e.g. release titled "Gallagher
+        // Premiership..." for a league whose canonical name is
+        // "English Prem Rugby"). League.AlternateName carries the
+        // upstream API's strLeagueAlternate, which is comma-separated.
         if (parseResult.Organization != null && evt.League != null)
         {
-            if (evt.League.Name.Contains(parseResult.Organization, StringComparison.OrdinalIgnoreCase) ||
-                parseResult.Organization.Contains(evt.League.Name, StringComparison.OrdinalIgnoreCase))
+            var leagueAliases = new List<string> { evt.League.Name };
+            if (!string.IsNullOrEmpty(evt.League.AlternateName))
+            {
+                leagueAliases.AddRange(SplitAliases(evt.League.AlternateName));
+            }
+
+            var matched = leagueAliases.Any(alias =>
+                alias.Contains(parseResult.Organization, StringComparison.OrdinalIgnoreCase) ||
+                parseResult.Organization.Contains(alias, StringComparison.OrdinalIgnoreCase));
+
+            if (matched)
             {
                 result.Confidence += 15;
                 result.MatchReasons.Add("League/organization matches");
@@ -809,6 +845,36 @@ public class ReleaseMatchingService
             normalizedRelease.Contains(NormalizeTitle(team.ShortName), StringComparison.OrdinalIgnoreCase))
             return true;
 
+        // Check upstream-API alternate names (TheSportsDB strAlternate). For
+        // teams whose canonical name is league-suffixed ("Chiefs Super Rugby")
+        // the alternates often contain the bare scene-name ("Chiefs"), which
+        // is what release groups actually use. Comma-separated; pipe and
+        // slash separators show up occasionally in TSDB.
+        if (team != null && !string.IsNullOrEmpty(team.AlternateName))
+        {
+            foreach (var alt in SplitAliases(team.AlternateName))
+            {
+                if (alt.Length < 2) continue;
+                if (normalizedRelease.Contains(NormalizeTitle(alt), StringComparison.OrdinalIgnoreCase))
+                    return true;
+            }
+        }
+
+        // League-suffix-strip fallback. For traveling-circuit / branded
+        // leagues the TSDB team name is "<Team> <League>" (e.g. "Chiefs
+        // Super Rugby", "Crusaders Super Rugby", "Otago Highlanders" with
+        // "Otago" being the regional prefix) but scene releases use the
+        // bare team token. Strip any of the known suffixes we recognize
+        // and check the remainder. See LeagueNameSuffixStripper for the
+        // suffix list.
+        var stripped = LeagueNameSuffixStripper.StripKnownSuffixes(teamName);
+        if (stripped != null && stripped.Length >= 3 &&
+            !stripped.Equals(teamName, StringComparison.OrdinalIgnoreCase))
+        {
+            if (normalizedRelease.Contains(NormalizeTitle(stripped), StringComparison.OrdinalIgnoreCase))
+                return true;
+        }
+
         // Check team name variations (abbreviations, nicknames, alternate forms)
         // e.g., "LA Clippers" for "Los Angeles Clippers", "OKC" for "Oklahoma City Thunder"
         foreach (var (canonicalName, variations) in TeamNameVariationData.Variations)
@@ -828,6 +894,22 @@ public class ReleaseMatchingService
         }
 
         return false;
+    }
+
+    /// <summary>
+    /// Split a comma/pipe/slash-separated alternate-name string into
+    /// individual aliases. TheSportsDB's strAlternate / strLeagueAlternate
+    /// uses commas in most cases but historical data has pipes and slashes
+    /// too, so we handle all three.
+    /// </summary>
+    private static IEnumerable<string> SplitAliases(string raw)
+    {
+        if (string.IsNullOrWhiteSpace(raw)) yield break;
+        foreach (var part in raw.Split(new[] { ',', '|', '/' }, StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
+        {
+            if (!string.IsNullOrWhiteSpace(part))
+                yield return part;
+        }
     }
 
     /// <summary>

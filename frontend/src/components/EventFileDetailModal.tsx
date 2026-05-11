@@ -1,10 +1,12 @@
 import { Fragment, useState, useEffect } from 'react';
 import { Dialog, Transition } from '@headlessui/react';
-import { XMarkIcon, TrashIcon, FolderIcon, FilmIcon, ArrowsRightLeftIcon } from '@heroicons/react/24/outline';
+import { XMarkIcon, TrashIcon, FolderIcon, FilmIcon, ArrowsRightLeftIcon, PencilIcon } from '@heroicons/react/24/outline';
 import ReassignEventFileModal from './ReassignEventFileModal';
 import { useMutation, useQueryClient } from '@tanstack/react-query';
 import apiClient from '../api/client';
 import { toast } from 'sonner';
+import FileMetadataEditModal from './FileMetadataEditModal';
+import type { FileMetadataEditorValues } from './FileMetadataEditor';
 
 interface EventFile {
   id: number;
@@ -19,6 +21,11 @@ interface EventFile {
   added: string;
   exists: boolean;
   originalTitle?: string;
+  releaseGroup?: string;
+  source?: string;
+  codec?: string;
+  languages?: string[];
+  indexerFlags?: string;
 }
 
 interface EventFileDetailModalProps {
@@ -77,6 +84,49 @@ export default function EventFileDetailModal({
 
   // Reassign dialog state - lets the user move a mismatched file to a different event
   const [reassignFile, setReassignFile] = useState<EventFile | null>(null);
+
+  // Metadata-edit modal state — single-file (file != null) or bulk (selectedIds non-empty).
+  const [editFile, setEditFile] = useState<EventFile | null>(null);
+  const [selectedIds, setSelectedIds] = useState<Set<number>>(new Set());
+  const [bulkEditOpen, setBulkEditOpen] = useState(false);
+
+  const toggleSelected = (id: number) => {
+    setSelectedIds((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+  };
+  const clearSelected = () => setSelectedIds(new Set());
+
+  // When the file list changes (delete/refetch), prune selections that no longer exist.
+  useEffect(() => {
+    if (selectedIds.size === 0) return;
+    const valid = new Set(localFiles.map((f) => f.id));
+    const next = new Set([...selectedIds].filter((id) => valid.has(id)));
+    if (next.size !== selectedIds.size) setSelectedIds(next);
+  }, [localFiles]);
+
+  const fileToEditorValues = (f: EventFile): FileMetadataEditorValues => ({
+    quality: f.quality,
+    source: f.source,
+    codec: f.codec,
+    releaseGroup: f.releaseGroup,
+    originalTitle: f.originalTitle,
+    languages: f.languages ?? [],
+    indexerFlags: f.indexerFlags,
+    partName: f.partName,
+    partNumber: f.partNumber ?? null,
+  });
+
+  const handleEditSaved = async () => {
+    // Refresh the list so the panel shows the latest stored values.
+    if (leagueId) {
+      await queryClient.refetchQueries({ queryKey: ['league-events', leagueId] });
+    }
+    await queryClient.refetchQueries({ queryKey: ['leagues'] });
+  };
 
   // Sync local state with prop when modal opens or files prop changes
   useEffect(() => {
@@ -249,19 +299,55 @@ export default function EventFileDetailModal({
                         <span>{formatFileSize(totalSize)}</span>
                       </div>
                     </div>
-                    {existingFiles.length > 1 && (
-                      <button
-                        onClick={() => {
-                          setDeleteAllBlocklistAction('none');
-                          setShowDeleteAllDialog(true);
-                        }}
-                        disabled={deleteAllFilesMutation.isPending || deleteFileMutation.isPending}
-                        className="px-2 md:px-3 py-1 md:py-1.5 bg-red-600 hover:bg-red-700 disabled:bg-red-600/50 text-white text-xs md:text-sm font-medium rounded transition-colors flex items-center gap-1.5 md:gap-2"
-                      >
-                        <TrashIcon className="w-3.5 h-3.5 md:w-4 md:h-4" />
-                        Delete All
-                      </button>
-                    )}
+                    <div className="flex items-center gap-2 flex-wrap">
+                      {existingFiles.length > 0 && (
+                        <button
+                          onClick={() => {
+                            const allIds = new Set(existingFiles.map((f) => f.id));
+                            const allSelected = existingFiles.every((f) => selectedIds.has(f.id));
+                            setSelectedIds(allSelected ? new Set() : allIds);
+                          }}
+                          className="px-2 md:px-3 py-1 md:py-1.5 bg-gray-700 hover:bg-gray-600 text-white text-xs md:text-sm rounded transition-colors"
+                        >
+                          {existingFiles.length > 0 && existingFiles.every((f) => selectedIds.has(f.id))
+                            ? 'Deselect All'
+                            : 'Select All'}
+                        </button>
+                      )}
+                      {selectedIds.size > 0 && (
+                        <>
+                          <span className="text-xs text-gray-300">
+                            {selectedIds.size} selected
+                          </span>
+                          <button
+                            onClick={() => setBulkEditOpen(true)}
+                            className="px-2 md:px-3 py-1 md:py-1.5 bg-blue-700 hover:bg-blue-600 text-white text-xs md:text-sm font-medium rounded transition-colors flex items-center gap-1.5"
+                          >
+                            <PencilIcon className="w-3.5 h-3.5" />
+                            Edit Selected
+                          </button>
+                          <button
+                            onClick={clearSelected}
+                            className="px-2 py-1 text-xs text-gray-300 hover:text-white"
+                          >
+                            Clear
+                          </button>
+                        </>
+                      )}
+                      {existingFiles.length > 1 && (
+                        <button
+                          onClick={() => {
+                            setDeleteAllBlocklistAction('none');
+                            setShowDeleteAllDialog(true);
+                          }}
+                          disabled={deleteAllFilesMutation.isPending || deleteFileMutation.isPending}
+                          className="px-2 md:px-3 py-1 md:py-1.5 bg-red-600 hover:bg-red-700 disabled:bg-red-600/50 text-white text-xs md:text-sm font-medium rounded transition-colors flex items-center gap-1.5 md:gap-2"
+                        >
+                          <TrashIcon className="w-3.5 h-3.5 md:w-4 md:h-4" />
+                          Delete All
+                        </button>
+                      )}
+                    </div>
                   </div>
                 </div>
 
@@ -276,9 +362,21 @@ export default function EventFileDetailModal({
                       {existingFiles.map((file) => (
                         <div
                           key={file.id}
-                          className="bg-gray-800 rounded-lg p-4 border border-gray-700"
+                          className={
+                            'rounded-lg p-4 border ' +
+                            (selectedIds.has(file.id)
+                              ? 'bg-blue-950/40 border-blue-600'
+                              : 'bg-gray-800 border-gray-700')
+                          }
                         >
                           <div className="flex items-start justify-between gap-4">
+                            <input
+                              type="checkbox"
+                              checked={selectedIds.has(file.id)}
+                              onChange={() => toggleSelected(file.id)}
+                              className="mt-1 accent-blue-600 cursor-pointer"
+                              title="Select for bulk edit"
+                            />
                             <div className="flex-1 min-w-0">
                               {/* Part Name (for fighting sports) */}
                               {isFightingSport && file.partName && (
@@ -330,6 +428,16 @@ export default function EventFileDetailModal({
                                 </div>
                               </details>
                             </div>
+
+                            {/* Edit Metadata Button */}
+                            <button
+                              onClick={() => setEditFile(file)}
+                              disabled={deleteFileMutation.isPending || deleteAllFilesMutation.isPending}
+                              className="p-2 text-gray-400 hover:text-emerald-400 hover:bg-emerald-600/10 rounded transition-colors disabled:opacity-50"
+                              title="Edit file metadata (Quality, ReleaseGroup, Languages…)"
+                            >
+                              <PencilIcon className="w-5 h-5" />
+                            </button>
 
                             {/* Reassign Button - move a mismatched file to a different event */}
                             <button
@@ -538,6 +646,50 @@ export default function EventFileDetailModal({
               await queryClient.refetchQueries({ queryKey: ['league', leagueId] });
             }
             await queryClient.refetchQueries({ queryKey: ['leagues'] });
+          }}
+        />
+      )}
+
+      {/* Per-row metadata editor.
+          key=editFile.id forces a fresh remount whenever the user clicks the
+          pencil on a different file, so the modal's internal state always
+          starts from that file's values rather than reusing the previous. */}
+      {editFile && (
+        <FileMetadataEditModal
+          key={`edit-${editFile.id}`}
+          isOpen={!!editFile}
+          onClose={() => setEditFile(null)}
+          fileIds={[editFile.id]}
+          initialValues={fileToEditorValues(editFile)}
+          showPartFields={isFightingSport}
+          eventId={eventId}
+          onSaved={async (updated) => {
+            if (updated && updated[0]) {
+              const u = updated[0];
+              setLocalFiles((prev) => prev.map((f) => (f.id === u.id ? { ...f, ...u } : f)));
+            }
+            await handleEditSaved();
+          }}
+        />
+      )}
+
+      {/* Bulk metadata editor (multi-select) */}
+      {bulkEditOpen && selectedIds.size > 0 && (
+        <FileMetadataEditModal
+          key={`bulk-${[...selectedIds].sort().join('-')}`}
+          isOpen={bulkEditOpen}
+          onClose={() => setBulkEditOpen(false)}
+          fileIds={[...selectedIds]}
+          initialValues={{}}
+          showPartFields={isFightingSport}
+          eventId={eventId}
+          onSaved={async (updated) => {
+            if (updated && updated.length) {
+              const byId = new Map(updated.map((u: any) => [u.id, u]));
+              setLocalFiles((prev) => prev.map((f) => (byId.has(f.id) ? { ...f, ...byId.get(f.id) } : f)));
+            }
+            clearSelected();
+            await handleEditSaved();
           }}
         />
       )}

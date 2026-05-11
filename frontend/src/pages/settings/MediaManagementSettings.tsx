@@ -27,6 +27,14 @@ interface RootFolder {
   path: string;
   accessible: boolean;
   freeSpace: number;
+  totalSpace: number;
+  defaultQualityProfileId?: number | null;
+  defaultDownloadClientCategory?: string | null;
+}
+
+interface QualityProfileOption {
+  id: number;
+  name: string;
 }
 
 interface MediaManagementSettingsData {
@@ -49,6 +57,7 @@ interface MediaManagementSettingsData {
   copyFiles: boolean;
   importExtraFiles: boolean;
   extraFileExtensions: string;
+  userRejectedExtensions: string;
   changeFileDate: string;
   recycleBin: string;
   recycleBinCleanup: number;
@@ -117,11 +126,21 @@ const SPORT_TYPES = [
 export default function MediaManagementSettings({ showAdvanced: propShowAdvanced = false }: MediaManagementSettingsProps) {
   const queryClient = useQueryClient();
   const [rootFolders, setRootFolders] = useState<RootFolder[]>([]);
+  const [qualityProfileOptions, setQualityProfileOptions] = useState<QualityProfileOption[]>([]);
+  // Per-root cache for the unmapped-folders endpoint. The list is opt-in
+  // so we don't walk the disk unsolicited every time the user opens the
+  // Settings page.
+  const [unmappedByRoot, setUnmappedByRoot] = useState<Record<number, { loading: boolean; folders: { name: string; path: string }[]; error?: string; expanded: boolean }>>({});
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
   const [showAddFolderModal, setShowAddFolderModal] = useState(false);
   const [showDeleteConfirm, setShowDeleteConfirm] = useState<number | null>(null);
   const [newFolderPath, setNewFolderPath] = useState('');
+  // Error from the most recent add-folder attempt. Surfaced inline in
+  // the Add modal so a validator rejection (write-test failed, system
+  // path, etc.) doesn't silently look like nothing happened.
+  const [addFolderError, setAddFolderError] = useState<string | null>(null);
+  const [addingFolder, setAddingFolder] = useState(false);
   const [showFileBrowser, setShowFileBrowser] = useState(false);
   const [hasUnsavedChanges, setHasUnsavedChanges] = useState(false);
   const initialSettings = useRef<MediaManagementSettingsData | null>(null);
@@ -285,6 +304,7 @@ export default function MediaManagementSettings({ showAdvanced: propShowAdvanced
     copyFiles: false,
     importExtraFiles: false,
     extraFileExtensions: 'srt,nfo',
+    userRejectedExtensions: '',
     changeFileDate: 'None',
     recycleBin: '',
     recycleBinCleanup: 7,
@@ -490,15 +510,50 @@ export default function MediaManagementSettings({ showAdvanced: propShowAdvanced
 
   const fetchRootFolders = async () => {
     try {
-      const response = await apiGet('/api/rootfolder');
-      if (response.ok) {
-        const data = await response.json();
+      const [foldersRes, profilesRes] = await Promise.all([
+        apiGet('/api/rootfolder'),
+        apiGet('/api/qualityprofile').catch(() => null),
+      ]);
+      if (foldersRes.ok) {
+        const data = await foldersRes.json();
         setRootFolders(data);
+      }
+      if (profilesRes && profilesRes.ok) {
+        const profiles = await profilesRes.json();
+        setQualityProfileOptions(Array.isArray(profiles) ? profiles : []);
       }
     } catch (error) {
       console.error('Failed to fetch root folders:', error);
     } finally {
       setLoading(false);
+    }
+  };
+
+  // PUT the per-root defaults back to /api/rootfolder/{id}. Called by the
+  // inline edits on each root folder card. We patch local state
+  // optimistically so the UI doesn't flash stale values; any error from
+  // the server reverts and surfaces a toast.
+  const updateRootFolderDefaults = async (
+    folderId: number,
+    patch: { defaultQualityProfileId?: number | null; defaultDownloadClientCategory?: string | null },
+  ) => {
+    const original = rootFolders.find(rf => rf.id === folderId);
+    if (!original) return;
+    const optimistic: RootFolder = { ...original, ...patch };
+    setRootFolders(prev => prev.map(rf => (rf.id === folderId ? optimistic : rf)));
+    try {
+      const response = await apiPut(`/api/rootfolder/${folderId}`, optimistic);
+      if (!response.ok) {
+        const body = await response.json().catch(() => null);
+        window.alert(`Failed to save root-folder defaults: ${body?.error ?? response.statusText}`);
+        setRootFolders(prev => prev.map(rf => (rf.id === folderId ? original : rf)));
+      } else {
+        const fresh = await response.json();
+        setRootFolders(prev => prev.map(rf => (rf.id === folderId ? fresh : rf)));
+      }
+    } catch (err) {
+      console.error('Failed to update root folder defaults:', err);
+      setRootFolders(prev => prev.map(rf => (rf.id === folderId ? original : rf)));
     }
   };
 
@@ -509,9 +564,12 @@ export default function MediaManagementSettings({ showAdvanced: propShowAdvanced
 
   const handleAddFolder = async () => {
     if (!newFolderPath.trim()) {
+      setAddFolderError('Folder path is required.');
       return;
     }
 
+    setAddFolderError(null);
+    setAddingFolder(true);
     try {
       const response = await apiPost('/api/rootfolder', {
         path: newFolderPath.trim(),
@@ -522,25 +580,60 @@ export default function MediaManagementSettings({ showAdvanced: propShowAdvanced
         setRootFolders(prev => [...prev, newFolder]);
         setShowAddFolderModal(false);
         setNewFolderPath('');
+        setAddFolderError(null);
       } else {
-        const error = await response.json();
-        console.error('Failed to add root folder:', error.error);
+        const body = await response.json().catch(() => null);
+        const message = body?.error ?? `HTTP ${response.status}: ${response.statusText}`;
+        console.error('Failed to add root folder:', message);
+        setAddFolderError(message);
       }
     } catch (error) {
       console.error('Failed to add folder:', error);
+      setAddFolderError((error as Error)?.message ?? 'Network error contacting Sportarr.');
+    } finally {
+      setAddingFolder(false);
     }
   };
 
-  const handleDeleteFolder = async (id: number) => {
+  const handleDeleteFolder = async (id: number, force: boolean = false) => {
     try {
-      const response = await apiDelete(`/api/rootfolder/${id}`);
+      const url = force ? `/api/rootfolder/${id}?force=true` : `/api/rootfolder/${id}`;
+      const response = await apiDelete(url);
 
       if (response.ok) {
         setRootFolders(prev => prev.filter(f => f.id !== id));
         setShowDeleteConfirm(null);
+        return;
       }
+
+      // 409: leagues are still bound to this root folder. Surface the
+      // conflict to the user with the option to force-detach the
+      // bindings before deleting. The API returns the offending league
+      // names so the prompt can list them.
+      if (response.status === 409) {
+        const body = await response.json().catch(() => null);
+        const leagueNames = (body?.leagues ?? [])
+          .map((l: { id: number; name: string }) => `  • ${l.name} (id ${l.id})`)
+          .join('\n');
+        const confirmed = window.confirm(
+          `${body?.error ?? 'Root folder is still bound to leagues.'}\n\n` +
+          `${leagueNames}\n\n` +
+          `Click OK to detach the bindings and delete the root folder anyway. ` +
+          `The leagues will fall back to free-space selection on their next import. ` +
+          `Click Cancel to leave everything as is.`
+        );
+        if (confirmed) {
+          await handleDeleteFolder(id, true);
+        }
+        return;
+      }
+
+      // Other failure path: surface whatever the server said.
+      const errBody = await response.json().catch(() => null);
+      window.alert(`Failed to delete folder: ${errBody?.error ?? response.statusText}`);
     } catch (error) {
       console.error('Failed to delete folder:', error);
+      window.alert('Failed to delete folder. See console for details.');
     }
   };
 
@@ -633,6 +726,42 @@ export default function MediaManagementSettings({ showAdvanced: propShowAdvanced
   // Note: In-app navigation blocking would require React Router's unstable_useBlocker
   // For now, we only block browser refresh/close via the useUnsavedChanges hook
 
+  // Toggle the Unmapped Folders panel for a given root folder. First open
+  // fetches the list lazily; subsequent opens reuse the cached result.
+  const toggleUnmapped = async (folderId: number) => {
+    const current = unmappedByRoot[folderId];
+    if (current?.expanded) {
+      setUnmappedByRoot(prev => ({ ...prev, [folderId]: { ...current, expanded: false } }));
+      return;
+    }
+    if (current?.folders) {
+      setUnmappedByRoot(prev => ({ ...prev, [folderId]: { ...current, expanded: true } }));
+      return;
+    }
+    setUnmappedByRoot(prev => ({ ...prev, [folderId]: { loading: true, folders: [], expanded: true } }));
+    try {
+      const response = await apiGet(`/api/rootfolder/${folderId}/unmappedfolders`);
+      if (!response.ok) {
+        const err = await response.json().catch(() => ({}));
+        setUnmappedByRoot(prev => ({
+          ...prev,
+          [folderId]: { loading: false, folders: [], expanded: true, error: err?.error ?? `HTTP ${response.status}` },
+        }));
+        return;
+      }
+      const body = await response.json();
+      setUnmappedByRoot(prev => ({
+        ...prev,
+        [folderId]: { loading: false, folders: body?.unmapped ?? [], expanded: true },
+      }));
+    } catch (err) {
+      setUnmappedByRoot(prev => ({
+        ...prev,
+        [folderId]: { loading: false, folders: [], expanded: true, error: (err as Error).message ?? 'Failed to load' },
+      }));
+    }
+  };
+
   return (
     <div>
       <SettingsHeader
@@ -673,35 +802,143 @@ export default function MediaManagementSettings({ showAdvanced: propShowAdvanced
         </p>
 
         <div className="space-y-2">
-          {rootFolders.map((folder) => (
-            <div
-              key={folder.id}
-              className="flex items-center justify-between p-4 bg-black/30 rounded-lg border border-gray-800"
-            >
-              <div className="flex items-center flex-1">
-                <FolderIcon className="w-5 h-5 text-red-400 mr-3" />
-                <div className="flex-1">
-                  <p className="text-white font-medium">{folder.path}</p>
-                  <p className="text-sm text-gray-400">
-                    Free Space: {formatBytes(folder.freeSpace)}
-                  </p>
+          {rootFolders.map((folder) => {
+            const unmappedState = unmappedByRoot[folder.id];
+            return (
+              <div
+                key={folder.id}
+                className="bg-black/30 rounded-lg border border-gray-800"
+              >
+                <div className="flex items-center justify-between p-4">
+                  <div className="flex items-center flex-1 min-w-0">
+                    <FolderIcon className="w-5 h-5 text-red-400 mr-3 flex-shrink-0" />
+                    <div className="flex-1 min-w-0">
+                      <p className="text-white font-medium truncate">{folder.path}</p>
+                      <p className="text-sm text-gray-400">
+                        {folder.totalSpace > 0
+                          ? `${formatBytes(folder.totalSpace - folder.freeSpace)} used · ${formatBytes(folder.freeSpace)} free of ${formatBytes(folder.totalSpace)}`
+                          : `Free Space: ${formatBytes(folder.freeSpace)}`}
+                      </p>
+                      {/* Disk-usage bar — purely visual, computed live each
+                          fetch. Bar fills red when usage exceeds 90% so a
+                          full disk pops out at a glance. */}
+                      {folder.accessible && folder.totalSpace > 0 && (() => {
+                        const usedPct = Math.min(100, Math.max(0, ((folder.totalSpace - folder.freeSpace) / folder.totalSpace) * 100));
+                        const barColor = usedPct >= 95 ? 'bg-red-600' : usedPct >= 85 ? 'bg-yellow-500' : 'bg-green-600';
+                        return (
+                          <div className="mt-2 h-1.5 w-full bg-gray-800 rounded overflow-hidden">
+                            <div className={`h-full ${barColor}`} style={{ width: `${usedPct.toFixed(1)}%` }} />
+                          </div>
+                        );
+                      })()}
+                    </div>
+                  </div>
+                  <div className="flex items-center space-x-3 flex-shrink-0">
+                    {folder.accessible ? (
+                      <CheckIcon className="w-5 h-5 text-green-500" />
+                    ) : (
+                      <XMarkIcon className="w-5 h-5 text-red-500" />
+                    )}
+                    <button
+                      onClick={() => toggleUnmapped(folder.id)}
+                      disabled={!folder.accessible}
+                      className="text-gray-400 hover:text-white text-sm transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+                      title={folder.accessible ? 'Show subfolders not yet mapped to a league' : 'Folder is not accessible'}
+                    >
+                      {unmappedState?.expanded ? 'Hide unmapped' : 'Show unmapped'}
+                    </button>
+                    <button
+                      onClick={() => setShowDeleteConfirm(folder.id)}
+                      className="text-gray-400 hover:text-red-400 text-sm transition-colors"
+                    >
+                      Delete
+                    </button>
+                  </div>
                 </div>
-              </div>
-              <div className="flex items-center space-x-3">
-                {folder.accessible ? (
-                  <CheckIcon className="w-5 h-5 text-green-500" />
-                ) : (
-                  <XMarkIcon className="w-5 h-5 text-red-500" />
+
+                {/* Per-root defaults (Phase 4): both optional. Quality
+                    Profile is suggested at league add time; download
+                    client category overrides the client's configured
+                    Category at grab time for any league bound to this
+                    root. Saves on change via PUT /api/rootfolder/{id}. */}
+                <div className="px-4 pb-3 grid grid-cols-1 md:grid-cols-2 gap-3 border-t border-gray-800/40 pt-3">
+                  <div>
+                    <label className="block text-xs text-gray-400 mb-1">Default Quality Profile</label>
+                    <select
+                      value={folder.defaultQualityProfileId ?? ''}
+                      onChange={(e) =>
+                        updateRootFolderDefaults(folder.id, {
+                          defaultQualityProfileId: e.target.value ? parseInt(e.target.value) : null,
+                        })
+                      }
+                      className="w-full px-2 py-1.5 bg-black border border-gray-700 text-gray-200 text-sm rounded focus:outline-none focus:border-red-600 focus:ring-1 focus:ring-red-600"
+                    >
+                      <option value="">No default (use global)</option>
+                      {qualityProfileOptions.map(qp => (
+                        <option key={qp.id} value={qp.id}>{qp.name}</option>
+                      ))}
+                    </select>
+                  </div>
+                  <div>
+                    <label className="block text-xs text-gray-400 mb-1">Download Client Category Override</label>
+                    <input
+                      type="text"
+                      value={folder.defaultDownloadClientCategory ?? ''}
+                      onChange={(e) =>
+                        setRootFolders(prev =>
+                          prev.map(rf =>
+                            rf.id === folder.id
+                              ? { ...rf, defaultDownloadClientCategory: e.target.value }
+                              : rf
+                          )
+                        )
+                      }
+                      onBlur={(e) =>
+                        updateRootFolderDefaults(folder.id, {
+                          defaultDownloadClientCategory: e.target.value.trim() === '' ? null : e.target.value.trim(),
+                        })
+                      }
+                      placeholder="(none — use download client's category)"
+                      className="w-full px-2 py-1.5 bg-black border border-gray-700 text-gray-200 text-sm rounded focus:outline-none focus:border-red-600 focus:ring-1 focus:ring-red-600"
+                    />
+                  </div>
+                </div>
+                {unmappedState?.expanded && (
+                  <div className="px-4 pb-4 border-t border-gray-800/60 pt-3">
+                    {unmappedState.loading ? (
+                      <p className="text-sm text-gray-400">Scanning…</p>
+                    ) : unmappedState.error ? (
+                      <p className="text-sm text-red-400">{unmappedState.error}</p>
+                    ) : unmappedState.folders.length === 0 ? (
+                      <p className="text-sm text-gray-500">No unmapped subfolders — every directory under this root matches an existing league.</p>
+                    ) : (
+                      <>
+                        <p className="text-xs text-gray-500 mb-2">
+                          {unmappedState.folders.length} subfolder{unmappedState.folders.length === 1 ? '' : 's'} not currently associated with a league. Use Library Import to adopt them.
+                        </p>
+                        <ul className="divide-y divide-gray-800/60">
+                          {unmappedState.folders.map(uf => (
+                            <li key={uf.path} className="flex items-center justify-between py-2">
+                              <div className="flex items-center min-w-0 flex-1">
+                                <FolderIcon className="w-4 h-4 text-yellow-500 mr-2 flex-shrink-0" />
+                                <span className="text-sm text-gray-200 truncate" title={uf.path}>{uf.name}</span>
+                              </div>
+                              <a
+                                href={`/library-import?path=${encodeURIComponent(uf.path)}`}
+                                className="px-2 py-1 text-xs bg-red-600/80 hover:bg-red-600 text-white rounded transition-colors flex-shrink-0 ml-3"
+                              >
+                                Library Import
+                              </a>
+                            </li>
+                          ))}
+                        </ul>
+                      </>
+                    )}
+                  </div>
                 )}
-                <button
-                  onClick={() => setShowDeleteConfirm(folder.id)}
-                  className="text-gray-400 hover:text-red-400 text-sm transition-colors"
-                >
-                  Delete
-                </button>
               </div>
-            </div>
-          ))}
+            );
+          })}
         </div>
 
         {rootFolders.length === 0 && (
@@ -1083,6 +1320,26 @@ export default function MediaManagementSettings({ showAdvanced: propShowAdvanced
               </p>
             </div>
           )}
+
+          {/* Pairs with the FailDownloads "User-Defined Extensions"
+              category set per indexer. Listed here in Importing because
+              that's where it lives in the upstream UX — and because
+              ExtraFileExtensions / UserRejectedExtensions are the two
+              "the user cares about file extensions" knobs and they
+              read more naturally side by side. */}
+          <div>
+            <label className="block text-white font-medium mb-2">User-Rejected Extensions</label>
+            <input
+              type="text"
+              value={settings.userRejectedExtensions ?? ''}
+              onChange={(e) => updateSetting('userRejectedExtensions', e.target.value)}
+              placeholder=".nfo, .url, .txt"
+              className="w-full px-4 py-2 bg-gray-800 border border-gray-700 rounded-lg text-white focus:outline-none focus:border-red-600"
+            />
+            <p className="text-sm text-gray-400 mt-1">
+              Comma-separated extensions to count against an indexer's <em>Fail Downloads → User-Defined Extensions</em> policy. Leave blank to disable that category.
+            </p>
+          </div>
 
           {showAdvanced && (
             <>
@@ -1680,7 +1937,10 @@ export default function MediaManagementSettings({ showAdvanced: propShowAdvanced
                   <input
                     type="text"
                     value={newFolderPath}
-                    onChange={(e) => setNewFolderPath(e.target.value)}
+                    onChange={(e) => {
+                      setNewFolderPath(e.target.value);
+                      if (addFolderError) setAddFolderError(null);
+                    }}
                     className="flex-1 px-4 py-2 bg-gray-800 border border-gray-700 rounded-lg text-white focus:outline-none focus:border-red-600"
                     placeholder="/data/sportarr or C:\Media\Sportarr"
                   />
@@ -1703,6 +1963,14 @@ export default function MediaManagementSettings({ showAdvanced: propShowAdvanced
                   and Sportarr has read/write permissions.
                 </p>
               </div>
+
+              {addFolderError && (
+                <div className="p-4 bg-red-950/30 border border-red-700/50 rounded-lg">
+                  <p className="text-sm text-red-300 whitespace-pre-wrap">
+                    <strong>Couldn't add folder:</strong> {addFolderError}
+                  </p>
+                </div>
+              )}
             </div>
 
             <div className="mt-6 flex items-center justify-end space-x-3">
@@ -1710,16 +1978,19 @@ export default function MediaManagementSettings({ showAdvanced: propShowAdvanced
                 onClick={() => {
                   setShowAddFolderModal(false);
                   setNewFolderPath('');
+                  setAddFolderError(null);
                 }}
-                className="px-4 py-2 bg-gray-800 hover:bg-gray-700 text-white rounded-lg transition-colors"
+                disabled={addingFolder}
+                className="px-4 py-2 bg-gray-800 hover:bg-gray-700 text-white rounded-lg transition-colors disabled:opacity-50"
               >
                 Cancel
               </button>
               <button
                 onClick={handleAddFolder}
-                className="px-4 py-2 bg-red-600 hover:bg-red-700 text-white rounded-lg transition-colors"
+                disabled={addingFolder}
+                className="px-4 py-2 bg-red-600 hover:bg-red-700 text-white rounded-lg transition-colors disabled:opacity-50"
               >
-                Add Folder
+                {addingFolder ? 'Adding…' : 'Add Folder'}
               </button>
             </div>
           </div>

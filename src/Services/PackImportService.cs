@@ -702,7 +702,7 @@ public class PackImportService
     {
         var fileInfo = new FileInfo(sourceFile);
         var fileName = Path.GetFileName(sourceFile);
-        var parsed = _parser.Parse(fileName);
+        var parsed = await _parser.ParseWithInspectionAsync(fileName, sourceFile);
 
         _logger.LogInformation("[Pack Import] Importing file: {FileName} -> {Event}", fileName, eventInfo.Title);
         _logger.LogDebug("[Pack Import] Parsed from file: Quality={Quality}, Codec={Codec}, Source={Source}, ReleaseGroup={Group}",
@@ -760,8 +760,9 @@ public class PackImportService
                 customFormatScore, string.Join(", ", matchedFormats));
         }
 
-        // Build destination path
-        var rootFolder = GetBestRootFolder(settings, fileInfo.Length);
+        // Build destination path. Prefer the league's bound RootFolderId
+        // when set, fall back to the legacy free-space heuristic otherwise.
+        var rootFolder = GetRootFolderForLeague(settings, eventInfo.League, fileInfo.Length);
         var destinationPath = await BuildDestinationPath(settings, eventInfo, parsed, fileInfo.Extension, rootFolder);
 
         _logger.LogDebug("[Pack Import] Destination path: {Path}", destinationPath);
@@ -842,18 +843,22 @@ public class PackImportService
         string filename;
         if (settings.RenameEvents)
         {
+            // Filename tokens use BroadcastDate (broadcaster-branded);
+            // see FileRenameService for the rationale.
+            var brandingDate = eventInfo.BroadcastDate ?? eventInfo.EventDate.Date;
+
             var tokens = new FileNamingTokens
             {
                 EventTitle = eventInfo.Title,
                 EventTitleThe = eventInfo.Title,
-                AirDate = eventInfo.EventDate,
+                AirDate = brandingDate,
                 Quality = parsed.Quality ?? "Unknown",
                 QualityFull = _parser.BuildQualityString(parsed),
                 ReleaseGroup = parsed.ReleaseGroup ?? string.Empty,
                 OriginalTitle = parsed.EventTitle,
                 OriginalFilename = Path.GetFileNameWithoutExtension(parsed.EventTitle),
                 Series = eventInfo.League?.Name ?? eventInfo.Sport,
-                Season = eventInfo.SeasonNumber?.ToString("0000") ?? eventInfo.Season ?? DateTime.UtcNow.Year.ToString(),
+                Season = eventInfo.SeasonNumber?.ToString("0000") ?? eventInfo.Season ?? brandingDate.Year.ToString(),
                 Episode = episodeNumber.ToString("00"),
                 Part = string.Empty
             };
@@ -938,8 +943,27 @@ public class PackImportService
         }
     }
 
-    private string GetBestRootFolder(MediaManagementSettings settings, long fileSize)
+    /// <summary>
+    /// Resolve the root folder for a league's pack import. Prefers an
+    /// explicit RootFolderId binding stored on the league, falls back to
+    /// free-space selection for legacy leagues without one.
+    /// </summary>
+    private string GetRootFolderForLeague(MediaManagementSettings settings, League? league, long fileSize)
     {
+        if (settings.RootFolders == null || settings.RootFolders.Count == 0)
+            throw new Exception("No root folders configured");
+
+        if (league?.RootFolderId is int boundId)
+        {
+            var bound = settings.RootFolders.FirstOrDefault(rf => rf.Id == boundId);
+            if (bound != null && bound.Accessible)
+                return bound.Path;
+
+            _logger.LogWarning(
+                "[Root Folders] League {LeagueId} ({LeagueName}) is bound to RootFolderId={BoundId} but it's missing or inaccessible — falling back to free-space selection.",
+                league.Id, league.Name, boundId);
+        }
+
         var rootFolders = settings.RootFolders
             .Where(rf => rf.Accessible)
             .OrderByDescending(rf => rf.FreeSpace)
@@ -987,10 +1011,7 @@ public class PackImportService
         var rootFolders = await _db.RootFolders.ToListAsync();
         if (rootFolders.Any())
         {
-            foreach (var folder in rootFolders)
-            {
-                folder.Accessible = Directory.Exists(folder.Path);
-            }
+            _diskSpaceService.RefreshLiveState(rootFolders);
             settings.RootFolders = rootFolders;
         }
 

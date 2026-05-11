@@ -1,4 +1,5 @@
 using System.Runtime.InteropServices;
+using Sportarr.Api.Models;
 
 namespace Sportarr.Api.Services;
 
@@ -422,5 +423,31 @@ public class DiskSpaceService
         public string FileSystem { get; set; } = "";
         public long AvailableFreeSpace { get; set; }
         public long TotalSize { get; set; }
+    }
+
+    /// <summary>
+    /// Refresh the live state (Accessible, FreeSpace, TotalSpace) on a list
+    /// of RootFolder rows after they're loaded from the DB. The persisted
+    /// columns were dropped so loaded rows arrive with default values; this
+    /// is the single place that fills them in for downstream code that
+    /// still needs to filter by accessibility or sort by free space.
+    /// </summary>
+    public void RefreshLiveState(IEnumerable<RootFolder> rootFolders)
+    {
+        foreach (var rf in rootFolders)
+        {
+            rf.Accessible = !string.IsNullOrWhiteSpace(rf.Path) && Directory.Exists(rf.Path);
+            if (rf.Accessible)
+            {
+                var (free, total) = GetDiskSpace(rf.Path);
+                rf.FreeSpace = free ?? 0;
+                rf.TotalSpace = total ?? 0;
+            }
+            else
+            {
+                rf.FreeSpace = 0;
+                rf.TotalSpace = 0;
+            }
+        }
     }
 }

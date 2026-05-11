@@ -217,6 +217,7 @@ public static class ServiceCollectionExtensions
     public static IServiceCollection AddSportarrFileServices(this IServiceCollection services)
     {
         services.AddScoped<MediaFileParser>();
+        services.AddScoped<MediaFileInspector>();
         services.AddScoped<SportsFileNameParser>();
         services.AddScoped<FileNamingService>();
         services.AddScoped<FileRenameService>();
@@ -231,6 +232,7 @@ public static class ServiceCollectionExtensions
         services.AddScoped<LeagueEventSyncService>();
         services.AddScoped<TeamLeagueDiscoveryService>();
         services.AddScoped<PackImportService>();
+        services.AddScoped<LeagueMoveService>();
 
         return services;
     }
@@ -249,7 +251,11 @@ public static class ServiceCollectionExtensions
         services.AddScoped<XmltvParserService>();
         services.AddScoped<EpgService>();
         services.AddScoped<EpgSchedulingService>();
+        services.AddScoped<EventChannelResolverService>();
         services.AddScoped<FilteredExportService>();
+        // Singleton because it caches the iptv-org/database CSV
+        // (~30k rows) in memory across requests.
+        services.AddSingleton<IptvOrgSyncService>();
 
         return services;
     }
@@ -275,6 +281,10 @@ public static class ServiceCollectionExtensions
 
         services.AddSingleton<DvrAutoSchedulerService>();
         services.AddHostedService(sp => sp.GetRequiredService<DvrAutoSchedulerService>());
+
+        // Reconciles DvrRecording.Status against actual ffmpeg state -
+        // catches crashes, app restarts, frozen upstream sources.
+        services.AddHostedService<DvrWatchdogService>();
 
         return services;
     }

@@ -44,6 +44,10 @@ interface DvrRecording {
   postPaddingMinutes: number;
   qualityProfileId?: number;
   qualityProfileName?: string;
+  // Multi-part fight cards (UFC etc.) tag the recording with which
+  // segment it covers - "Early Prelims", "Prelims", "Main Card".
+  // Surfaced inline next to the title.
+  partName?: string;
 }
 
 interface SportEvent {
@@ -56,6 +60,35 @@ interface SportEvent {
   };
   hasRecording: boolean;
   recordingId?: number;
+}
+
+// Live stat shape returned by /api/dvr/active. The backend pulls
+// these every poll from FFmpegRecorderService's in-memory tracker -
+// they do not hit the DB while the recording is still running.
+interface ActiveRecordingStat {
+  recordingId: number;
+  isActive: boolean;
+  startTime: string;
+  durationSeconds: number;
+  fileSize?: number | null;
+  currentBitrate?: number | null;
+}
+
+function formatBytes(n?: number | null): string {
+  if (n == null || n <= 0) return '—';
+  const units = ['B', 'KiB', 'MiB', 'GiB', 'TiB'];
+  let v = n;
+  let i = 0;
+  while (v >= 1024 && i < units.length - 1) { v /= 1024; i++; }
+  return `${v.toFixed(v >= 100 ? 0 : v >= 10 ? 1 : 2)} ${units[i]}`;
+}
+
+function formatBitrate(bitsPerSec?: number | null): string {
+  if (bitsPerSec == null || bitsPerSec <= 0) return '—';
+  const mbps = bitsPerSec / 1_000_000;
+  if (mbps >= 1) return `${mbps.toFixed(2)} Mbps`;
+  const kbps = bitsPerSec / 1_000;
+  return `${kbps.toFixed(0)} kbps`;
 }
 
 // Status color mappings for recording status
@@ -86,9 +119,43 @@ export default function DvrSchedulePage() {
   const navigate = useNavigate();
   const dateInputRef = useRef<HTMLInputElement>(null);
 
+  // Live stats per active (Recording) row: file size + current
+  // bitrate. Polled separately from the schedule list so the row
+  // chrome doesn't flicker on every refresh.
+  const [activeStats, setActiveStats] = useState<Record<number, ActiveRecordingStat>>({});
+
   useEffect(() => {
     loadData();
   }, []);
+
+  // Poll live stats for any Recording-status row every 5s. We
+  // reuse /api/dvr/active which the FFmpegRecorderService backs
+  // with its in-memory _activeRecordings tracker. Stats only flow
+  // while the row is actually transcoding; once the row leaves
+  // Recording status, the entry drops out of the response and we
+  // stop showing live stats for it.
+  const hasActive = recordings.some((r) => r.status === 'Recording');
+  useEffect(() => {
+    if (!hasActive) {
+      setActiveStats({});
+      return;
+    }
+    let cancelled = false;
+    const tick = async () => {
+      try {
+        const res = await apiClient.get<ActiveRecordingStat[]>('/dvr/active');
+        if (cancelled) return;
+        const map: Record<number, ActiveRecordingStat> = {};
+        for (const s of res.data) map[s.recordingId] = s;
+        setActiveStats(map);
+      } catch {
+        if (!cancelled) setActiveStats({});
+      }
+    };
+    tick();
+    const id = window.setInterval(tick, 5000);
+    return () => { cancelled = true; window.clearInterval(id); };
+  }, [hasActive]);
 
   const loadData = async () => {
     setLoading(true);
@@ -543,7 +610,14 @@ export default function DvrSchedulePage() {
                                     </span>
                                   )}
                                 </div>
-                                <h4 className="font-medium text-white truncate">{recording.eventTitle}</h4>
+                                <h4 className="font-medium text-white truncate">
+                                  {recording.eventTitle}
+                                  {recording.partName && (
+                                    <span className="ml-2 text-xs text-amber-400 bg-amber-900/30 px-2 py-0.5 rounded font-normal">
+                                      {recording.partName}
+                                    </span>
+                                  )}
+                                </h4>
                                 <div className="flex flex-wrap items-center gap-4 mt-2 text-sm text-gray-400">
                                   <span className="flex items-center gap-1">
                                     <SignalIcon className="w-4 h-4" />
@@ -561,6 +635,24 @@ export default function DvrSchedulePage() {
                                   <div className="mt-1 text-xs text-gray-500 flex items-center gap-1">
                                     <FilmIcon className="w-3 h-3" />
                                     {recording.qualityProfileName}
+                                  </div>
+                                )}
+                                {recording.status === 'Recording' && activeStats[recording.id] && (
+                                  <div className="mt-2 flex flex-wrap items-center gap-3 text-xs">
+                                    <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded bg-red-900/40 text-red-300 border border-red-700/40">
+                                      <span className="w-2 h-2 rounded-full bg-red-500 animate-pulse" />
+                                      LIVE
+                                    </span>
+                                    <span className="text-gray-300">
+                                      {Math.floor(activeStats[recording.id].durationSeconds / 60)}m{' '}
+                                      {(activeStats[recording.id].durationSeconds % 60).toString().padStart(2, '0')}s
+                                    </span>
+                                    <span className="text-gray-300">
+                                      {formatBytes(activeStats[recording.id].fileSize)}
+                                    </span>
+                                    <span className="text-gray-300">
+                                      {formatBitrate(activeStats[recording.id].currentBitrate)}
+                                    </span>
                                   </div>
                                 )}
                               </div>

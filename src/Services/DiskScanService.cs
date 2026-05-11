@@ -91,17 +91,57 @@ public class DiskScanService : BackgroundService, IAsyncDisposable
     /// <summary>
     /// Scan all event files and verify they exist on disk.
     /// Optimized to use AsNoTracking and batch updates for memory efficiency.
+    ///
+    /// Missing-file handling is grace-period based: when a path's File.Exists()
+    /// flips from true to false the row is marked Exists=false and stamped
+    /// MissingSince=now. The hard-delete only happens after the file has been
+    /// continuously missing for Config.EventFileMissingDeleteAfterDays. Files
+    /// living under root folders that aren't currently reachable (mount not
+    /// attached, NAS down, restored backup whose paths haven't been remapped
+    /// yet) are skipped entirely so a transient outage can't trigger the
+    /// missing-transition for a thousand files at once.
     /// </summary>
     private async Task ScanAllFilesAsync(CancellationToken cancellationToken)
     {
         using var scope = _serviceProvider.CreateScope();
         var db = scope.ServiceProvider.GetRequiredService<SportarrDbContext>();
+        var configService = scope.ServiceProvider.GetRequiredService<ConfigService>();
+        var config = await configService.GetConfigAsync();
 
         _logger.LogInformation("[Disk Scan] Starting disk scan...");
+
+        // Identify unreachable root folders up front. Files under any of them
+        // are excluded from the existence check — we don't know whether they're
+        // really missing or the mount is just down, so we leave their state
+        // alone instead of marking them missing. This is the equivalent of
+        // Sonarr's "skip cleanup when the series folder is missing" guard,
+        // applied at the root-folder level.
+        var settings = await db.MediaManagementSettings.FirstOrDefaultAsync(cancellationToken);
+        var unreachableRoots = (settings?.RootFolders ?? new List<RootFolder>())
+            .Where(rf => !string.IsNullOrEmpty(rf.Path) && !Directory.Exists(rf.Path))
+            .Select(rf => rf.Path)
+            .ToList();
+        var unreachableRootsLookup = unreachableRoots
+            .Select(p => p.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar) + Path.DirectorySeparatorChar)
+            .ToList();
+        if (unreachableRoots.Count > 0)
+        {
+            _logger.LogWarning(
+                "[Disk Scan] Skipping miss-detection for files under {Count} unreachable root folder(s): {Roots}",
+                unreachableRoots.Count, string.Join(", ", unreachableRoots));
+        }
+
+        bool IsUnderUnreachableRoot(string? path)
+        {
+            if (string.IsNullOrEmpty(path) || unreachableRootsLookup.Count == 0) return false;
+            return unreachableRootsLookup.Any(prefix =>
+                path.StartsWith(prefix, StringComparison.OrdinalIgnoreCase));
+        }
 
         var totalMissing = 0;
         var totalFound = 0;
         var totalVerified = 0;
+        var totalSkippedUnreachable = 0;
 
         // First, scan Events table directly using AsNoTracking and batch updates
         // Only select the fields we need to check file existence
@@ -117,6 +157,11 @@ public class DiskScanService : BackgroundService, IAsyncDisposable
         var missingEventIds = new List<int>();
         foreach (var evt in eventsToCheck)
         {
+            if (IsUnderUnreachableRoot(evt.FilePath))
+            {
+                totalSkippedUnreachable++;
+                continue;
+            }
             if (!File.Exists(evt.FilePath))
             {
                 _logger.LogWarning("[Disk Scan] Missing file for event '{Title}': {FilePath}", evt.Title, evt.FilePath);
@@ -129,23 +174,23 @@ public class DiskScanService : BackgroundService, IAsyncDisposable
             }
         }
 
-        // Batch update missing events using ExecuteUpdateAsync (no tracking needed)
+        // Batch update missing events. Only flips HasFile=false; FilePath /
+        // FileSize / Quality stay so the next scan can re-verify when the
+        // path becomes reachable again. Cleanup of these fields happens
+        // separately, after the grace period elapses, gated on EventFiles'
+        // MissingSince column.
         if (missingEventIds.Count > 0)
         {
             await db.Events
                 .Where(e => missingEventIds.Contains(e.Id))
-                .ExecuteUpdateAsync(s => s
-                    .SetProperty(e => e.HasFile, false)
-                    .SetProperty(e => e.FilePath, (string?)null)
-                    .SetProperty(e => e.FileSize, (long?)null)
-                    .SetProperty(e => e.Quality, (string?)null),
+                .ExecuteUpdateAsync(s => s.SetProperty(e => e.HasFile, false),
                     cancellationToken);
         }
 
         // Then scan EventFiles table using AsNoTracking
         var eventFilesToCheck = await db.EventFiles
             .AsNoTracking()
-            .Select(ef => new { ef.Id, ef.FilePath, ef.Exists, EventTitle = ef.Event != null ? ef.Event.Title : null })
+            .Select(ef => new { ef.Id, ef.FilePath, ef.Exists, ef.MissingSince, EventTitle = ef.Event != null ? ef.Event.Title : null })
             .ToListAsync(cancellationToken);
 
         _logger.LogInformation("[Disk Scan] Checking {Count} event file records...", eventFilesToCheck.Count);
@@ -156,6 +201,12 @@ public class DiskScanService : BackgroundService, IAsyncDisposable
 
         foreach (var file in eventFilesToCheck)
         {
+            if (IsUnderUnreachableRoot(file.FilePath))
+            {
+                totalSkippedUnreachable++;
+                continue;
+            }
+
             var exists = File.Exists(file.FilePath);
             var previousExists = file.Exists;
 
@@ -182,31 +233,41 @@ public class DiskScanService : BackgroundService, IAsyncDisposable
             }
         }
 
-        // Batch update files that are now missing
+        // Batch update files that are now missing.
+        // Stamp MissingSince=now for the grace-period cleanup downstream.
         if (filesToMarkMissing.Count > 0)
         {
             await db.EventFiles
                 .Where(ef => filesToMarkMissing.Contains(ef.Id))
                 .ExecuteUpdateAsync(s => s
                     .SetProperty(ef => ef.Exists, false)
+                    .SetProperty(ef => ef.MissingSince, (DateTime?)now)
                     .SetProperty(ef => ef.LastVerified, now),
                     cancellationToken);
         }
 
-        // Batch update files that are now found
+        // Batch update files that are now found.
+        // Clear MissingSince so the grace-period clock resets if the file
+        // ever goes missing again.
         if (filesToMarkFound.Count > 0)
         {
             await db.EventFiles
                 .Where(ef => filesToMarkFound.Contains(ef.Id))
                 .ExecuteUpdateAsync(s => s
                     .SetProperty(ef => ef.Exists, true)
+                    .SetProperty(ef => ef.MissingSince, (DateTime?)null)
                     .SetProperty(ef => ef.LastVerified, now),
                     cancellationToken);
         }
 
-        // Update LastVerified for all existing files (that weren't changed)
+        // Update LastVerified for all existing files (that weren't changed
+        // and weren't skipped due to unreachable root)
+        var processedIds = new HashSet<int>(filesToMarkMissing.Concat(filesToMarkFound));
+        var skippedIds = new HashSet<int>(eventFilesToCheck
+            .Where(f => IsUnderUnreachableRoot(f.FilePath))
+            .Select(f => f.Id));
         var unchangedFileIds = eventFilesToCheck
-            .Where(f => !filesToMarkMissing.Contains(f.Id) && !filesToMarkFound.Contains(f.Id))
+            .Where(f => !processedIds.Contains(f.Id) && !skippedIds.Contains(f.Id))
             .Select(f => f.Id)
             .ToList();
 
@@ -217,16 +278,49 @@ public class DiskScanService : BackgroundService, IAsyncDisposable
                 .ExecuteUpdateAsync(s => s.SetProperty(ef => ef.LastVerified, now), cancellationToken);
         }
 
-        // Clean up stale EventFile records:
-        // 1. Remove records marked Exists=false (leftover from old upgrade logic that marked instead of removing)
-        // 2. Remove duplicate records for the same event (keep only the newest Exists=true record per event+part)
-        var staleRemoved = await db.EventFiles
-            .Where(ef => !ef.Exists)
-            .ExecuteDeleteAsync(cancellationToken);
-
-        if (staleRemoved > 0)
+        // Grace-period hard-delete. Rows that have been continuously missing
+        // for longer than Config.EventFileMissingDeleteAfterDays get pruned.
+        // 0 = never auto-delete. The grace period covers backup-restore and
+        // transient unreachability while still letting genuine user
+        // deletions clean themselves up over time.
+        var graceDays = config.EventFileMissingDeleteAfterDays;
+        if (graceDays > 0)
         {
-            _logger.LogInformation("[Disk Scan] Cleaned up {Count} stale EventFile records (Exists=false)", staleRemoved);
+            var cutoff = now.AddDays(-graceDays);
+            var staleRemoved = await db.EventFiles
+                .Where(ef => !ef.Exists && ef.MissingSince != null && ef.MissingSince <= cutoff)
+                .ExecuteDeleteAsync(cancellationToken);
+
+            if (staleRemoved > 0)
+            {
+                _logger.LogInformation(
+                    "[Disk Scan] Pruned {Count} EventFile rows missing for more than {Days} days",
+                    staleRemoved, graceDays);
+            }
+
+            // Apply the same cutoff to the Event-level Quality/FilePath/FileSize
+            // wipe. An Event with HasFile=false and ALL of its EventFiles either
+            // gone or still missing past the cutoff is genuinely deleted; we
+            // can clear the legacy direct fields without losing recoverable
+            // metadata. Done as a single SQL statement so we don't load the
+            // whole Events table into memory.
+            var eventsWithLingeringPath = await db.Events
+                .Where(e => !e.HasFile && e.FilePath != null && !e.Files.Any(f => f.Exists || (f.MissingSince != null && f.MissingSince > cutoff)))
+                .Select(e => e.Id)
+                .ToListAsync(cancellationToken);
+            if (eventsWithLingeringPath.Count > 0)
+            {
+                await db.Events
+                    .Where(e => eventsWithLingeringPath.Contains(e.Id))
+                    .ExecuteUpdateAsync(s => s
+                        .SetProperty(e => e.FilePath, (string?)null)
+                        .SetProperty(e => e.FileSize, (long?)null)
+                        .SetProperty(e => e.Quality, (string?)null),
+                        cancellationToken);
+                _logger.LogInformation(
+                    "[Disk Scan] Cleared legacy file fields on {Count} events whose files are past the grace period",
+                    eventsWithLingeringPath.Count);
+            }
         }
 
         // Find events with duplicate Exists=true file records (same event, same part or both null)
@@ -326,16 +420,15 @@ public class DiskScanService : BackgroundService, IAsyncDisposable
             }
         }
 
-        // Batch update events marked as missing
+        // Batch update events marked as missing. Only flips HasFile=false;
+        // FilePath / FileSize / Quality stay (see earlier comment in the
+        // direct-path-check branch above for the rationale — temporarily
+        // unreachable paths must not destroy user data).
         if (eventsToMarkMissing.Count > 0)
         {
             await db.Events
                 .Where(e => eventsToMarkMissing.Contains(e.Id))
-                .ExecuteUpdateAsync(s => s
-                    .SetProperty(e => e.HasFile, false)
-                    .SetProperty(e => e.FilePath, (string?)null)
-                    .SetProperty(e => e.FileSize, (long?)null)
-                    .SetProperty(e => e.Quality, (string?)null),
+                .ExecuteUpdateAsync(s => s.SetProperty(e => e.HasFile, false),
                     cancellationToken);
         }
 

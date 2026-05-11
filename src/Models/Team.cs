@@ -1,4 +1,5 @@
 using System.Text.Json.Serialization;
+using Sportarr.Api.Helpers;
 
 namespace Sportarr.Api.Models;
 
@@ -77,23 +78,42 @@ public class Team
     [JsonPropertyName("strDescriptionEN")]
     public string? Description { get; set; }
 
+    // Image URLs go through ImageUrlNormalizer so legacy
+    // www.thesportsdb.com URLs get rewritten to r2.thesportsdb.com
+    // on assignment. See League.LogoUrl for the rationale.
+
     /// <summary>
     /// Team badge/logo URL
     /// </summary>
     [JsonPropertyName("strTeamBadge")]
-    public string? BadgeUrl { get; set; }
+    public string? BadgeUrl
+    {
+        get => _badgeUrl;
+        set => _badgeUrl = ImageUrlNormalizer.Normalize(value);
+    }
+    private string? _badgeUrl;
 
     /// <summary>
     /// Team jersey/kit image URL
     /// </summary>
     [JsonPropertyName("strTeamJersey")]
-    public string? JerseyUrl { get; set; }
+    public string? JerseyUrl
+    {
+        get => _jerseyUrl;
+        set => _jerseyUrl = ImageUrlNormalizer.Normalize(value);
+    }
+    private string? _jerseyUrl;
 
     /// <summary>
     /// Team banner image URL
     /// </summary>
     [JsonPropertyName("strTeamBanner")]
-    public string? BannerUrl { get; set; }
+    public string? BannerUrl
+    {
+        get => _bannerUrl;
+        set => _bannerUrl = ImageUrlNormalizer.Normalize(value);
+    }
+    private string? _bannerUrl;
 
     /// <summary>
     /// Official team website

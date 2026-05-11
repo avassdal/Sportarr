@@ -16,6 +16,12 @@ export interface Event {
   season?: string; // Season identifier (e.g., "2024", "2024-25")
   round?: string; // Round/week number (e.g., "Week 10", "Quarterfinals")
   eventDate: string;
+  // Broadcast-local date (YYYY-MM-DD) used for filenames and the
+  // broadcaster's branding date. Calendar UI should prefer this over
+  // eventDate to avoid US-evening events showing on the wrong day.
+  broadcastDate?: string;
+  // IANA timezone (e.g. "America/New_York") for localized time display.
+  broadcastTimezone?: string;
   venue?: string;
   location?: string;
   broadcast?: string; // TV broadcast information (network, channel)

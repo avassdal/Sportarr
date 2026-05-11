@@ -118,10 +118,41 @@ public class BacklogSearchService : BackgroundService
         if (oldestAllowed.HasValue)
             cutoffQuery = cutoffQuery.Where(e => e.EventDate >= oldestAllowed.Value);
 
-        var cutoffEventIds = await cutoffQuery
+        // Pull existing-file quality strings alongside the candidate so we can
+        // filter out events whose stored quality is unparseable (score 0). Auto
+        // cutoff-upgrade against an unparseable existing quality would always
+        // succeed and re-download library-imported files. The upgrade gate in
+        // AutomaticSearchService will refuse them anyway, so skipping here saves
+        // the indexer queries (9 indexers x N events per pass).
+        var cutoffCandidates = await cutoffQuery
             .OrderByDescending(e => e.EventDate)
-            .Select(e => new { e.Id, e.Title })
+            .Select(e => new
+            {
+                e.Id,
+                e.Title,
+                EventQuality = e.Quality,
+                FileQualities = e.Files.Where(f => f.Exists).Select(f => f.Quality).ToList()
+            })
             .ToListAsync(cancellationToken);
+
+        var cutoffEventIds = cutoffCandidates
+            .Where(c =>
+            {
+                // Prefer EventFile rows; fall back to Event-level Quality for legacy rows.
+                var qualities = c.FileQualities.Count > 0
+                    ? c.FileQualities
+                    : new List<string?> { c.EventQuality };
+                return qualities.Any(q => ReleaseEvaluator.CalculateQualityScoreFromName(q) > 0);
+            })
+            .Select(c => new { c.Id, c.Title })
+            .ToList();
+
+        var skippedUnparseable = cutoffCandidates.Count - cutoffEventIds.Count;
+        if (skippedUnparseable > 0)
+        {
+            _logger.LogInformation("[Backlog Search] Skipped {Count} cutoff-upgrade candidates with unparseable existing quality (use manual search to upgrade)",
+                skippedUnparseable);
+        }
 
         var totalEvents = missingEventIds.Count + cutoffEventIds.Count;
         if (totalEvents == 0)
