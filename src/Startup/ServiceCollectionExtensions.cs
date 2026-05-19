@@ -220,6 +220,14 @@ public static class ServiceCollectionExtensions
         services.AddScoped<HealthCheckService>();
         services.AddScoped<BackupService>();
         services.AddScoped<NotificationService>();
+        // Backup-restore reconciliation stack. PathRemap + LibraryRescan
+        // are scoped so they pick up a fresh DbContext per request (the
+        // db file gets replaced during restore so reusing a singleton
+        // would hold the old handle); RestoreReconciliationService
+        // composes them.
+        services.AddScoped<PathRemapService>();
+        services.AddScoped<LibraryRescanService>();
+        services.AddScoped<RestoreReconciliationService>();
 
         return services;
     }

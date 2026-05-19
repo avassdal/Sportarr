@@ -158,6 +158,15 @@ public class LeagueEventSyncService
             _logger.LogInformation("[League Event Sync] {Sport} sport detected - team filtering disabled (events don't have home/away teams)", league.Sport);
         }
 
+        // Authoritative season list from upstream, used by the
+        // stale-season cleanup below regardless of whether the
+        // sync loop only walks a current/future subset of it.
+        // Stays null when the caller passed an explicit seasons
+        // list (we have no full-catalog reference in that case
+        // and the stale-season cleanup must be skipped to avoid
+        // wrongly flagging the un-iterated seasons as orphan).
+        List<string>? fullHubSeasons = null;
+
         // Default to smart season fetching if no seasons specified
         // Query Sportarr API for actual available seasons instead of guessing years
         if (seasons == null || !seasons.Any())
@@ -174,6 +183,7 @@ public class LeagueEventSyncService
                     .Where(s => !string.IsNullOrEmpty(s.StrSeason))
                     .Select(s => s.StrSeason!)
                     .ToList();
+                fullHubSeasons = allSeasons.ToList();
 
                 if (fullHistoricalSync)
                 {
@@ -480,6 +490,86 @@ public class LeagueEventSyncService
                 season, seasonEventsProcessed, result.NewCount - seasonStartCount + result.UpdatedCount, result.UpdatedCount);
         }
 
+        // Stale-season cleanup: events tagged with a Season string the
+        // API no longer returns. The per-season loop above only walks
+        // seasons hub currently lists, so events from a season hub has
+        // since consolidated away (e.g. an old "1992-1993" sibling that
+        // hub deduped into "1992", or a "2026" orphan that hub merged
+        // into "2025-2026") sit forever in the local DB untouched.
+        //
+        // CRITICAL: compares against `fullHubSeasons` (the unfiltered
+        // upstream catalog) rather than the local `seasons` variable.
+        // In optimized refreshes `seasons` only holds current/future
+        // entries, so using it here would flag every legitimate
+        // historical season as "stale" and the halfway-threshold
+        // guard would refuse to clean anything (the original bug
+        // that left the 1-event "1992-1993" / "1991-1992" / "1990-1991"
+        // orphans visible after a daily refresh even though hub had
+        // already deduped them).
+        //
+        // Skips when the caller passed in a custom seasons list
+        // (fullHubSeasons stays null in that path) -- without the
+        // full catalog to compare against, anything outside the
+        // caller-supplied list would look stale even when it is
+        // actually a legitimate season the caller chose not to sync.
+        if (fullHubSeasons != null && fullHubSeasons.Any())
+        {
+            var hubSeasons = new HashSet<string>(fullHubSeasons, StringComparer.OrdinalIgnoreCase);
+
+            var localEventsByLeague = await _db.Events
+                .Include(e => e.Files)
+                .Where(e => e.LeagueId == league.Id && e.Season != null)
+                .ToListAsync();
+
+            var staleEvents = localEventsByLeague
+                .Where(e => !string.IsNullOrEmpty(e.Season) && !hubSeasons.Contains(e.Season!))
+                .ToList();
+
+            if (staleEvents.Any())
+            {
+                var staleSeasonCounts = staleEvents
+                    .GroupBy(e => e.Season!)
+                    .ToDictionary(g => g.Key, g => g.Count());
+
+                // Halfway threshold guard: if the events tagged with
+                // stale season strings outweigh more than half the
+                // league's footprint, something is wrong upstream
+                // (a corrupted season-list response) and a wholesale
+                // delete would destroy real data. Bail with a
+                // warning -- next refresh runs again and re-evaluates.
+                if (localEventsByLeague.Count > 0 &&
+                    staleEvents.Count > localEventsByLeague.Count / 2)
+                {
+                    _logger.LogWarning(
+                        "[League Event Sync] Stale-season cleanup: {Stale}/{Total} local events sit under {SeasonCount} season(s) the API no longer returns. Refusing cleanup -- ratio is too high to trust. Investigate the upstream season list before retrying. Stale seasons: {Seasons}",
+                        staleEvents.Count, localEventsByLeague.Count, staleSeasonCounts.Count,
+                        string.Join(", ", staleSeasonCounts.Select(kv => $"{kv.Key}={kv.Value}")));
+                }
+                else
+                {
+                    int removedFromStaleSeasons = 0;
+                    foreach (var stale in staleEvents)
+                    {
+                        if (stale.HasFile || stale.Files.Any())
+                        {
+                            _logger.LogWarning(
+                                "[League Event Sync] Removing stale-season event '{Title}' (S{Season}) which has {FileCount} file(s) on disk - files left for manual cleanup",
+                                stale.Title, stale.Season, stale.Files.Count);
+                            _db.EventFiles.RemoveRange(stale.Files);
+                        }
+                        _db.Events.Remove(stale);
+                        removedFromStaleSeasons++;
+                    }
+
+                    result.RemovedCount += removedFromStaleSeasons;
+                    _logger.LogInformation(
+                        "[League Event Sync] Stale-season cleanup: removed {Count} event(s) across {SeasonCount} season(s) no longer in API: {Seasons}",
+                        removedFromStaleSeasons, staleSeasonCounts.Count,
+                        string.Join(", ", staleSeasonCounts.Select(kv => $"{kv.Key}={kv.Value}")));
+                }
+            }
+        }
+
         // Update league's last sync timestamp
         league.LastUpdate = DateTime.UtcNow;
         await _db.SaveChangesAsync();
@@ -707,17 +797,29 @@ public class LeagueEventSyncService
     {
         if (string.IsNullOrEmpty(league.ExternalId)) return;
 
+        // The TTL gate that used to short-circuit this method when
+        // MetadataLastSyncedAt was within the past 7 days has been
+        // removed. The hub is the authoritative cache and its image
+        // URLs carry a `?v={generation}-{hash}` query string that
+        // changes whenever the underlying bytes change, so asking the
+        // hub on every sync is cheap: when nothing has changed the
+        // local LogoUrl / BannerUrl / PosterUrl / etc. are overwritten
+        // with the same string they already held and the browser
+        // continues to use its cached image. When something has
+        // changed (a new primary image was set on the hub, an upload
+        // landed, an admin replaced the artwork) the URL is different,
+        // sportarr writes the new URL, and the browser refetches on
+        // its own. Running the lookup unconditionally keeps logos,
+        // badges, posters, and descriptions in sync with the hub on
+        // exactly the same cadence as events and seasons -- the user-
+        // facing refresh button (and the background auto-sync) now
+        // updates artwork like everything else, without needing a
+        // "force refresh" toggle.
+        //
+        // MetadataLastSyncedAt is still written below so the field
+        // remains queryable for "when did we last hear from upstream"
+        // diagnostics, just not consulted as a gate.
         var lastSync = league.MetadataLastSyncedAt;
-        var isStale = lastSync == null || (DateTime.UtcNow - lastSync.Value) >= _leagueMetadataTtl;
-        if (!forceRefresh && !isStale)
-        {
-            _logger.LogDebug(
-                "[League Event Sync] Skipping metadata refresh for {LeagueName}: last sync {Hours}h ago, TTL {TtlHours}h",
-                league.Name,
-                lastSync.HasValue ? (DateTime.UtcNow - lastSync.Value).TotalHours : 0,
-                _leagueMetadataTtl.TotalHours);
-            return;
-        }
 
         try
         {

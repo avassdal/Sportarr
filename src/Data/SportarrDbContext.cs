@@ -69,6 +69,10 @@ public class SportarrDbContext : DbContext
     // Followed teams (for cross-league team monitoring)
     public DbSet<FollowedTeam> FollowedTeams => Set<FollowedTeam>();
 
+    // Backup-restore audit trail: one row per restore operation, capturing
+    // what survived the reconciliation pass and what was remapped.
+    public DbSet<RestoreReport> RestoreReports => Set<RestoreReport>();
+
     protected override void OnModelCreating(ModelBuilder modelBuilder)
     {
         base.OnModelCreating(modelBuilder);

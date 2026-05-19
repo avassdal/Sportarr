@@ -20,6 +20,48 @@ interface BackupInfo {
   createdAt: string;
 }
 
+interface RestoreReport {
+  id: number;
+  backupFileName: string;
+  startedAt: string;
+  completedAt?: string | null;
+  totalEventFiles: number;
+  filesFound: number;
+  filesMissing: number;
+  filesSkippedUnreachableRoot: number;
+  pathRemapsJson?: string | null;
+  sourceHost?: string | null;
+  sourceSportarrVersion?: string | null;
+  status: string;
+  notes?: string | null;
+}
+
+interface PathRemapPreview {
+  missingFileCount: number;
+  oldPrefix?: string | null;
+  newPrefix?: string | null;
+  sampleSize: number;
+  sampleMatches: number;
+  affectedRowCount: number;
+  notes: string;
+  hasSuggestion: boolean;
+}
+
+interface LibraryRescanResult {
+  startedAt: string;
+  completedAt?: string | null;
+  rootsScanned: number;
+  totalFilesScanned: number;
+  matchedFiles: number;
+  unmatchedFiles: number;
+  alreadyInLibraryFiles: number;
+  autoImported: number;
+  importFailures: number;
+  importSkipped: number;
+  unreachableRoots: string[];
+  notes: string;
+}
+
 const BackupPage: React.FC = () => {
   const [backups, setBackups] = useState<BackupInfo[]>([]);
   const [loading, setLoading] = useState(true);
@@ -30,8 +72,20 @@ const BackupPage: React.FC = () => {
   const [showDeleteConfirm, setShowDeleteConfirm] = useState<string | null>(null);
   const [backupNote, setBackupNote] = useState('');
 
+  // Phase 1-3 state. Restore reports drive the post-restore reconciliation
+  // panel; the remap preview drives the "we think your paths drifted -- want
+  // us to fix them?" wizard; rescanResult shows the outcome of a full
+  // library rescan triggered from the maintenance card.
+  const [restoreReports, setRestoreReports] = useState<RestoreReport[]>([]);
+  const [remapPreview, setRemapPreview] = useState<PathRemapPreview | null>(null);
+  const [remapBusy, setRemapBusy] = useState(false);
+  const [rescanBusy, setRescanBusy] = useState(false);
+  const [rescanResult, setRescanResult] = useState<LibraryRescanResult | null>(null);
+  const [uploading, setUploading] = useState(false);
+
   useEffect(() => {
     fetchBackups();
+    fetchRestoreReports();
   }, []);
 
   // Pull the most useful message out of an error response. The
@@ -104,14 +158,120 @@ const BackupPage: React.FC = () => {
 
       const result = await response.json();
       toast.success('Backup Restored', {
-        description: result.message || 'Backup restored successfully! Please restart Sportarr.',
+        description: result.message || 'Backup restored. Reconciliation running.',
         duration: 10000,
       });
       setShowRestoreConfirm(null);
+      // Refresh the report list so the new entry appears immediately.
+      // The orchestrator updates the same row out of band as the disk
+      // scan completes, so a brief delayed re-fetch picks up the final
+      // counts. We do not block on it: the user can come back later.
+      fetchRestoreReports();
+      setTimeout(fetchRestoreReports, 5_000);
+      setTimeout(fetchRestoreReports, 30_000);
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Failed to restore backup');
     } finally {
       setRestoring(false);
+    }
+  };
+
+  const fetchRestoreReports = async () => {
+    try {
+      const response = await apiGet('/api/system/restore-reports');
+      if (!response.ok) return;
+      const data = await response.json();
+      if (Array.isArray(data)) setRestoreReports(data);
+    } catch {
+      /* non-fatal; the panel just stays empty */
+    }
+  };
+
+  // Path-remap wizard. Detect inspects every missing EventFile and
+  // computes a candidate prefix rewrite that resolves them against the
+  // configured root folders. Apply executes the rewrite atomically.
+  // Both are read-only by default; the apply step is gated on the
+  // confirm button.
+  const handleDetectRemap = async () => {
+    setRemapBusy(true);
+    setError(null);
+    try {
+      const response = await apiGet('/api/library/remap/preview');
+      if (!response.ok) throw new Error('Failed to detect path drift');
+      const preview = await response.json();
+      setRemapPreview(preview);
+      if (!preview.hasSuggestion) {
+        toast.info('No path drift detected', { description: preview.notes });
+      }
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Failed to detect path drift');
+    } finally {
+      setRemapBusy(false);
+    }
+  };
+
+  const handleApplyRemap = async () => {
+    if (!remapPreview || !remapPreview.hasSuggestion) return;
+    setRemapBusy(true);
+    setError(null);
+    try {
+      const response = await apiPost('/api/library/remap/apply', {
+        from: remapPreview.oldPrefix,
+        to: remapPreview.newPrefix,
+      });
+      if (!response.ok) throw new Error('Failed to apply remap');
+      const result = await response.json();
+      toast.success('Paths remapped', {
+        description: `Rewrote ${result.affected} EventFile rows. Disk scan triggered.`,
+      });
+      setRemapPreview(null);
+      fetchRestoreReports();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Failed to apply remap');
+    } finally {
+      setRemapBusy(false);
+    }
+  };
+
+  const handleLibraryRescan = async () => {
+    setRescanBusy(true);
+    setError(null);
+    setRescanResult(null);
+    try {
+      const response = await apiPost('/api/library/rescan', {});
+      if (!response.ok) throw new Error('Failed to rescan library');
+      const result = await response.json();
+      setRescanResult(result);
+      toast.success('Library rescan complete', {
+        description: result.notes,
+        duration: 8000,
+      });
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Failed to rescan library');
+    } finally {
+      setRescanBusy(false);
+    }
+  };
+
+  const handleBackupUpload = async (file: File) => {
+    setUploading(true);
+    setError(null);
+    try {
+      const form = new FormData();
+      form.append('backup', file);
+      const response = await fetch('/api/system/backup/upload', {
+        method: 'POST',
+        body: form,
+      });
+      if (!response.ok) throw new Error('Upload failed');
+      toast.success('Backup uploaded', {
+        description: 'You can now restore from it like any other backup below.',
+      });
+      await fetchBackups();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Failed to upload backup');
+    } finally {
+      setUploading(false);
     }
   };
 
@@ -292,6 +452,163 @@ const BackupPage: React.FC = () => {
             ))}
           </div>
         )}
+      </div>
+
+      {/* Reconciliation + library maintenance. Surfaces what post-restore
+          reconciliation found, lets the admin remap path prefixes when
+          paths drifted between source and target hosts, and exposes the
+          rescan-library button for catching files that exist on disk
+          but aren't in the EventFile table. Sits below the backup list
+          because it's the next thing an admin reaches for after a
+          restore. */}
+      <div className="bg-gray-900 rounded-lg border border-gray-700 p-6 mt-6">
+        <h2 className="text-xl font-semibold text-white mb-2">
+          Reconciliation &amp; library maintenance
+        </h2>
+        <p className="text-sm text-gray-400 mb-4">
+          After a backup restore, the disk scanner verifies every file path
+          against on-disk reality. Use the tools below to fix path drift
+          (when the backup came from a machine with different storage
+          paths) and to import media files that exist on disk but aren't
+          yet linked to events.
+        </p>
+
+        {/* Upload from another machine */}
+        <div className="grid grid-cols-1 md:grid-cols-2 gap-4 mb-6">
+          <div className="bg-gray-800 rounded p-4 border border-gray-700">
+            <h3 className="text-sm font-semibold text-white mb-1">Upload backup from another machine</h3>
+            <p className="text-xs text-gray-400 mb-3">
+              Drop in a backup zip from another Sportarr instance. It
+              lands in the backups folder and shows up in the list above.
+            </p>
+            <input
+              type="file"
+              accept=".zip,application/zip"
+              disabled={uploading}
+              onChange={(e) => {
+                const f = e.target.files?.[0];
+                if (f) handleBackupUpload(f);
+                e.target.value = '';
+              }}
+              className="block w-full text-sm text-gray-300 file:mr-3 file:py-1.5 file:px-3 file:rounded file:border-0 file:text-sm file:font-medium file:bg-blue-600 file:text-white hover:file:bg-blue-500"
+            />
+            {uploading && (
+              <p className="mt-2 text-xs text-blue-400">Uploading...</p>
+            )}
+          </div>
+
+          {/* Library rescan */}
+          <div className="bg-gray-800 rounded p-4 border border-gray-700">
+            <h3 className="text-sm font-semibold text-white mb-1">Rescan library</h3>
+            <p className="text-xs text-gray-400 mb-3">
+              Walk every configured root folder and auto-import media
+              files that match known events. Medium-confidence matches
+              land in Library Import for review.
+            </p>
+            <button
+              type="button"
+              onClick={handleLibraryRescan}
+              disabled={rescanBusy}
+              className="px-3 py-1.5 text-sm bg-blue-600 text-white rounded hover:bg-blue-500 disabled:opacity-50"
+            >
+              {rescanBusy ? 'Rescanning...' : 'Rescan library'}
+            </button>
+            {rescanResult && (
+              <div className="mt-3 text-xs text-gray-300 space-y-0.5">
+                <div>Roots scanned: <span className="text-white">{rescanResult.rootsScanned}</span></div>
+                <div>Files scanned: <span className="text-white">{rescanResult.totalFilesScanned}</span></div>
+                <div>Matched: <span className="text-green-400">{rescanResult.matchedFiles}</span></div>
+                <div>Auto-imported: <span className="text-green-400">{rescanResult.autoImported}</span></div>
+                <div>Unmatched: <span className="text-yellow-400">{rescanResult.unmatchedFiles}</span></div>
+                {rescanResult.unreachableRoots.length > 0 && (
+                  <div className="text-red-400">Unreachable roots: {rescanResult.unreachableRoots.join(', ')}</div>
+                )}
+              </div>
+            )}
+          </div>
+        </div>
+
+        {/* Path remap */}
+        <div className="bg-gray-800 rounded p-4 border border-gray-700 mb-6">
+          <h3 className="text-sm font-semibold text-white mb-1">Path remap</h3>
+          <p className="text-xs text-gray-400 mb-3">
+            When a backup was produced on a host with different storage
+            paths, EventFile rows still point at the old paths. Detect
+            scans the missing-file set and suggests a single prefix
+            rewrite that resolves them under your configured root folders.
+          </p>
+          <button
+            type="button"
+            onClick={handleDetectRemap}
+            disabled={remapBusy}
+            className="px-3 py-1.5 text-sm bg-blue-600 text-white rounded hover:bg-blue-500 disabled:opacity-50"
+          >
+            {remapBusy ? 'Detecting...' : 'Detect path drift'}
+          </button>
+          {remapPreview && (
+            <div className="mt-3 text-xs text-gray-300 space-y-1">
+              <div>Missing files: <span className="text-white">{remapPreview.missingFileCount}</span></div>
+              {remapPreview.hasSuggestion ? (
+                <>
+                  <div>Old prefix: <span className="font-mono text-yellow-400">{remapPreview.oldPrefix}</span></div>
+                  <div>New prefix: <span className="font-mono text-green-400">{remapPreview.newPrefix}</span></div>
+                  <div>Sample resolution: {remapPreview.sampleMatches}/{remapPreview.sampleSize}</div>
+                  <div>Will rewrite: <span className="text-white">{remapPreview.affectedRowCount}</span> EventFile rows</div>
+                  <button
+                    type="button"
+                    onClick={handleApplyRemap}
+                    disabled={remapBusy}
+                    className="mt-2 px-3 py-1.5 text-sm bg-green-600 text-white rounded hover:bg-green-500 disabled:opacity-50"
+                  >
+                    Apply remap
+                  </button>
+                </>
+              ) : (
+                <div className="text-gray-400">{remapPreview.notes}</div>
+              )}
+            </div>
+          )}
+        </div>
+
+        {/* Restore reports */}
+        <div className="bg-gray-800 rounded p-4 border border-gray-700">
+          <h3 className="text-sm font-semibold text-white mb-2">Recent restore reports</h3>
+          {restoreReports.length === 0 ? (
+            <p className="text-xs text-gray-400">
+              No reports yet. After you restore a backup, the
+              reconciliation outcome shows up here.
+            </p>
+          ) : (
+            <div className="space-y-2">
+              {restoreReports.slice(0, 5).map((r) => (
+                <div key={r.id} className="text-xs text-gray-300 bg-gray-900 rounded p-3 border border-gray-700">
+                  <div className="flex justify-between mb-1">
+                    <span className="font-mono text-white truncate" title={r.backupFileName}>{r.backupFileName}</span>
+                    <span className={
+                      r.status === 'completed' ? 'text-green-400' :
+                      r.status === 'failed' ? 'text-red-400' : 'text-yellow-400'
+                    }>{r.status}</span>
+                  </div>
+                  <div className="grid grid-cols-2 md:grid-cols-4 gap-2">
+                    <div>Total files: <span className="text-white">{r.totalEventFiles}</span></div>
+                    <div>Found: <span className="text-green-400">{r.filesFound}</span></div>
+                    <div>Missing: <span className="text-yellow-400">{r.filesMissing}</span></div>
+                    <div>Skipped: <span className="text-gray-400">{r.filesSkippedUnreachableRoot}</span></div>
+                  </div>
+                  {r.sourceHost && (
+                    <div className="mt-1 text-gray-400">
+                      From host <span className="text-white">{r.sourceHost}</span>
+                      {r.sourceSportarrVersion && (<> running v{r.sourceSportarrVersion}</>)}
+                    </div>
+                  )}
+                  {r.notes && (
+                    <div className="mt-1 text-yellow-400 whitespace-pre-wrap">{r.notes}</div>
+                  )}
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
       </div>
 
       {/* Restore Confirmation Modal */}
