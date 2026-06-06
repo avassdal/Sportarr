@@ -1480,9 +1480,17 @@ public class QBittorrentClient
             _logger.LogDebug("[qBittorrent] Login response: Status={StatusCode}", response.StatusCode);
             _logger.LogTrace("[qBittorrent] Login response body: {Body}", responseBody);
 
-            if (response.IsSuccessStatusCode)
+            // qBittorrent returns HTTP 200 for BOTH a successful and a rejected
+            // login; the body is the real signal ("Ok." vs "Fails."). A 403
+            // means the Web UI temporarily banned this IP after repeated failed
+            // attempts. Branch on all three so the log says what actually
+            // happened instead of a misleading "appeared successful".
+            var trimmedBody = (responseBody ?? string.Empty).Trim();
+            var loginOk = response.IsSuccessStatusCode &&
+                          trimmedBody.StartsWith("Ok.", StringComparison.OrdinalIgnoreCase);
+
+            if (loginOk)
             {
-                // Store cookie for subsequent requests
                 if (response.Headers.TryGetValues("Set-Cookie", out var cookies))
                 {
                     _cookie = cookies.FirstOrDefault();
@@ -1493,15 +1501,37 @@ public class QBittorrentClient
                         _customHttpClient.DefaultRequestHeaders.Add("Cookie", _cookie);
                     }
                     _logger.LogDebug("[qBittorrent] Login successful, session cookie stored");
-                    return true;
                 }
                 else
                 {
-                    _logger.LogWarning("[qBittorrent] Login appeared successful but no session cookie received");
+                    // "Ok." with no cookie = qBittorrent bypassed authentication
+                    // (this client IP is whitelisted, or "Bypass authentication
+                    // for clients on localhost" is enabled). Subsequent requests
+                    // work without a SID, so treat it as a success.
+                    _logger.LogInformation(
+                        "[qBittorrent] Authentication bypassed for this client (whitelisted IP or localhost); proceeding without a session cookie");
                 }
+                return true;
             }
 
-            _logger.LogWarning("[qBittorrent] Login failed: Status={Status}, Response={Response}", response.StatusCode, responseBody);
+            if (response.StatusCode == System.Net.HttpStatusCode.Forbidden)
+            {
+                _logger.LogWarning(
+                    "[qBittorrent] Login blocked (HTTP 403): this IP is temporarily banned after repeated failed logins. " +
+                    "Fix the credentials, then wait out the ban or restart qBittorrent.");
+            }
+            else if (trimmedBody.StartsWith("Fails.", StringComparison.OrdinalIgnoreCase))
+            {
+                _logger.LogWarning(
+                    "[qBittorrent] Login rejected (\"Fails.\"): the Web UI username/password is wrong. " +
+                    "Check Tools -> Options -> Web UI -> Authentication in qBittorrent and re-enter it in Sportarr. " +
+                    "Fresh installs use a random temporary password printed in qBittorrent's own log.");
+            }
+            else
+            {
+                _logger.LogWarning("[qBittorrent] Login failed: Status={Status}, Response={Response}",
+                    response.StatusCode, trimmedBody);
+            }
             return false;
         }
         catch (OperationCanceledException) when (cts.IsCancellationRequested)
