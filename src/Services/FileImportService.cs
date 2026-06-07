@@ -993,7 +993,9 @@ public class FileImportService : IFileImportService
                     message.Contains("not on the same disk"))
                 {
                     _logger.LogWarning("[Transfer] Hardlink failed (cross-device/volume) - falling back to copy. " +
-                        "To use hardlinks, ensure source and destination are on the same filesystem/volume.");
+                        "Source dir '{SourceDir}' and destination dir '{DestDir}' are on different mounts. " +
+                        "Hardlinks require both the download and library paths to live under a single shared volume/mount.",
+                        Path.GetDirectoryName(source), Path.GetDirectoryName(destination));
                 }
                 else
                 {
