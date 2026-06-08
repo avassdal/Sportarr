@@ -60,6 +60,60 @@ public class SportarrApiClient
         }
     }
 
+    /// <summary>
+    /// Fetch the player cast for one event from the hub's agent episode
+    /// endpoint. That endpoint lives at the hub root (/api/metadata/agents/...),
+    /// not under the v2/json base, and resolves either a hub short_id or a
+    /// TheSportsDB event id. Returns null on any failure - cast is best-effort
+    /// enrichment and must never break a metadata response.
+    /// </summary>
+    public async Task<List<HubCastMember>?> GetEventCastAsync(string externalId)
+    {
+        if (string.IsNullOrWhiteSpace(externalId))
+            return null;
+        try
+        {
+            // _apiBaseUrl is the v2/json shim base (".../api/v2/json"); the
+            // agent endpoints hang off the hub root, so strip the shim suffix.
+            var root = _apiBaseUrl.Replace("/api/v2/json", string.Empty).TrimEnd('/');
+            var url = $"{root}/api/metadata/agents/episode/{Uri.EscapeDataString(externalId)}";
+
+            using var response = await _httpClient.GetAsync(url);
+            if (!response.IsSuccessStatusCode)
+                return null;
+
+            var json = await response.Content.ReadAsStringAsync();
+            using var doc = JsonDocument.Parse(json);
+            if (!doc.RootElement.TryGetProperty("players", out var players)
+                || players.ValueKind != JsonValueKind.Array)
+                return null;
+
+            var cast = new List<HubCastMember>();
+            foreach (var p in players.EnumerateArray())
+            {
+                var name = p.TryGetProperty("name", out var n) ? n.GetString() : null;
+                if (string.IsNullOrWhiteSpace(name))
+                    continue;
+                cast.Add(new HubCastMember
+                {
+                    Name = name,
+                    Team = p.TryGetProperty("team", out var t) ? t.GetString() : null,
+                    Side = p.TryGetProperty("side", out var s) ? s.GetString() : null,
+                    Position = p.TryGetProperty("position", out var pos) ? pos.GetString() : null,
+                    Number = p.TryGetProperty("number", out var num) && num.ValueKind != JsonValueKind.Null
+                        ? (num.ValueKind == JsonValueKind.String ? num.GetString() : num.ToString())
+                        : null,
+                });
+            }
+            return cast;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "[SportarrAPI] Failed to fetch cast for event {Id}", externalId);
+            return null;
+        }
+    }
+
     #region Search Endpoints
 
     /// <summary>
