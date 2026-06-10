@@ -244,6 +244,18 @@ public class LeagueEventSyncService
         _logger.LogInformation("[League Event Sync] Syncing {Count} seasons for league: {LeagueName}",
             seasons.Count, league.Name);
 
+        // One-query preload of every Scheduled DVR recording, replacing the
+        // former per-existing-event lookup — one DB round-trip per event and
+        // the second-largest contributor in the [Sync Metrics] baseline.
+        // Grouped by EventId; rows realigned inside ProcessEvent stay
+        // tracked on this context, so the per-season SaveChanges persists
+        // them exactly as the per-event query version did.
+        var scheduledRecordingsByEventId = (await _db.DvrRecordings
+                .Where(r => r.Status == DvrRecordingStatus.Scheduled && r.EventId != null)
+                .ToListAsync())
+            .GroupBy(r => r.EventId!.Value)
+            .ToDictionary(g => g.Key, g => g.ToList());
+
         int seasonIndex = 0;
         // Sync each season
         foreach (var season in seasons)
@@ -319,12 +331,60 @@ public class LeagueEventSyncService
                 // Don't continue - fall through to cleanup
             }
 
+            // Per-season preload of the existence-lookup working set and the
+            // team links, replacing one to two Events round-trips plus up to
+            // two Teams round-trips per event — the N+1 the [Sync Metrics]
+            // baseline put at ~2 DB commands per event. One Contains query
+            // each; EF translates the id list as a single JSON parameter, so
+            // the statement stays constant-size regardless of season size.
+            // Rows come back tracked, so field updates inside ProcessEvent
+            // persist on the per-season SaveChanges exactly as before.
+            var apiIds = new HashSet<string>();
+            foreach (var ev in events)
+            {
+                if (!string.IsNullOrEmpty(ev.ExternalId)) apiIds.Add(ev.ExternalId!);
+                if (!string.IsNullOrEmpty(ev.TsdbId)) apiIds.Add(ev.TsdbId!);
+            }
+            var existingByExternalId = new Dictionary<string, Event>();
+            if (apiIds.Count > 0)
+            {
+                var idList = apiIds.ToList();
+                var existingRows = await _db.Events
+                    .Where(e => e.ExternalId != null && idList.Contains(e.ExternalId!))
+                    .ToListAsync();
+                foreach (var row in existingRows)
+                {
+                    // TryAdd preserves FirstOrDefault's take-the-first
+                    // behavior should duplicate ExternalId rows exist.
+                    existingByExternalId.TryAdd(row.ExternalId!, row);
+                }
+            }
+
+            var apiTeamIds = new HashSet<string>();
+            foreach (var ev in events)
+            {
+                if (!string.IsNullOrEmpty(ev.HomeTeamExternalId)) apiTeamIds.Add(ev.HomeTeamExternalId!);
+                if (!string.IsNullOrEmpty(ev.AwayTeamExternalId)) apiTeamIds.Add(ev.AwayTeamExternalId!);
+            }
+            var teamsByExternalId = new Dictionary<string, Team>();
+            if (apiTeamIds.Count > 0)
+            {
+                var teamIdList = apiTeamIds.ToList();
+                foreach (var team in await _db.Teams
+                    .Where(t => t.ExternalId != null && teamIdList.Contains(t.ExternalId!))
+                    .ToListAsync())
+                {
+                    teamsByExternalId.TryAdd(team.ExternalId!, team);
+                }
+            }
+
             // Process each event
             foreach (var apiEvent in events)
             {
                 try
                 {
-                    await ProcessEventAsync(apiEvent, league, result, currentSeason, apiEpisodeMap);
+                    ProcessEvent(apiEvent, league, result, currentSeason, apiEpisodeMap,
+                        existingByExternalId, teamsByExternalId, scheduledRecordingsByEventId);
                 }
                 catch (Exception ex)
                 {
@@ -343,7 +403,7 @@ public class LeagueEventSyncService
             // the TheSportsDB id from before the hub flip must be
             // recognised in this set or the cleanup pass below
             // hard-deletes them on every sync until they happen to
-            // be processed by ProcessEventAsync's migration step.
+            // be processed by ProcessEvent's migration step.
             var apiExternalIds = new HashSet<string>();
             foreach (var ev in events)
             {
@@ -898,9 +958,15 @@ public class LeagueEventSyncService
     /// Process a single event from Sportarr API API
     /// </summary>
     /// <param name="apiEpisodeMap">Episode numbers from sportarr.net API (ExternalId -> EpisodeNumber). If null, falls back to local calculation.</param>
-    private async Task ProcessEventAsync(Event apiEvent, League league, LeagueEventSyncResult result, string currentSeason, Dictionary<string, int>? apiEpisodeMap = null)
+    private void ProcessEvent(Event apiEvent, League league, LeagueEventSyncResult result, string currentSeason,
+        Dictionary<string, int>? apiEpisodeMap,
+        Dictionary<string, Event> existingByExternalId,
+        Dictionary<string, Team> teamsByExternalId,
+        Dictionary<int, List<DvrRecording>> scheduledRecordingsByEventId)
     {
-        // Two-pass match against the local Events table.
+        // Two-pass match against the preloaded existence dictionary (one
+        // bulk query per season replaces the former one-to-two DB
+        // round-trips per event).
         //
         // Hub flipped its wire-primary identifier from the TheSportsDB
         // external id to its own short_id (ev-XXXXXX) in May 2026.
@@ -917,13 +983,15 @@ public class LeagueEventSyncService
         // Step 3: when the fallback match succeeds, rewrite the local
         //         ExternalId to the short_id so the next sync matches
         //         on the primary path directly. One-time per row.
-        var existingEvent = await _db.Events
-            .FirstOrDefaultAsync(e => e.ExternalId == apiEvent.ExternalId);
+        Event? existingEvent = null;
+        if (!string.IsNullOrEmpty(apiEvent.ExternalId))
+        {
+            existingByExternalId.TryGetValue(apiEvent.ExternalId!, out existingEvent);
+        }
 
         if (existingEvent == null && !string.IsNullOrEmpty(apiEvent.TsdbId))
         {
-            existingEvent = await _db.Events
-                .FirstOrDefaultAsync(e => e.ExternalId == apiEvent.TsdbId);
+            existingByExternalId.TryGetValue(apiEvent.TsdbId!, out existingEvent);
 
             if (existingEvent != null && !string.IsNullOrEmpty(apiEvent.ExternalId))
             {
@@ -931,6 +999,7 @@ public class LeagueEventSyncService
                     "[League Event Sync] Migrating event ExternalId from TheSportsDB id {OldId} to hub short_id {NewId} ('{Title}')",
                     apiEvent.TsdbId, apiEvent.ExternalId, apiEvent.Title);
                 existingEvent.ExternalId = apiEvent.ExternalId;
+                existingByExternalId.TryAdd(apiEvent.ExternalId!, existingEvent);
             }
         }
 
@@ -978,10 +1047,9 @@ public class LeagueEventSyncService
             // preserves the original duration (ScheduledEnd - ScheduledStart)
             // and the user's PrePadding / PostPadding exactly. Only rows
             // in Scheduled status are touched, never live or historical.
-            var scheduledRecordings = await _db.DvrRecordings
-                .Where(r => r.EventId == existingEvent.Id
-                            && r.Status == DvrRecordingStatus.Scheduled)
-                .ToListAsync();
+            var scheduledRecordings = scheduledRecordingsByEventId.TryGetValue(existingEvent.Id, out var recs)
+                ? recs
+                : new List<DvrRecording>();
             foreach (var rec in scheduledRecordings)
             {
                 if (rec.ScheduledStart == existingEvent.EventDate)
@@ -1184,24 +1252,19 @@ public class LeagueEventSyncService
         int? awayTeamId = null;
 
         // Try to link to existing Team entities using external IDs
-        if (!string.IsNullOrEmpty(apiEvent.HomeTeamExternalId))
+        // (preloaded per season — no per-event Teams round-trips)
+        if (!string.IsNullOrEmpty(apiEvent.HomeTeamExternalId) &&
+            teamsByExternalId.TryGetValue(apiEvent.HomeTeamExternalId!, out var homeTeam))
         {
-            var homeTeam = await _db.Teams.FirstOrDefaultAsync(t => t.ExternalId == apiEvent.HomeTeamExternalId);
-            homeTeamId = homeTeam?.Id;
-            if (homeTeam != null)
-            {
-                _logger.LogDebug("[League Event Sync] Linked home team: {TeamName}", homeTeam.Name);
-            }
+            homeTeamId = homeTeam.Id;
+            _logger.LogDebug("[League Event Sync] Linked home team: {TeamName}", homeTeam.Name);
         }
 
-        if (!string.IsNullOrEmpty(apiEvent.AwayTeamExternalId))
+        if (!string.IsNullOrEmpty(apiEvent.AwayTeamExternalId) &&
+            teamsByExternalId.TryGetValue(apiEvent.AwayTeamExternalId!, out var awayTeam))
         {
-            var awayTeam = await _db.Teams.FirstOrDefaultAsync(t => t.ExternalId == apiEvent.AwayTeamExternalId);
-            awayTeamId = awayTeam?.Id;
-            if (awayTeam != null)
-            {
-                _logger.LogDebug("[League Event Sync] Linked away team: {TeamName}", awayTeam.Name);
-            }
+            awayTeamId = awayTeam.Id;
+            _logger.LogDebug("[League Event Sync] Linked away team: {TeamName}", awayTeam.Name);
         }
 
         // Create new event entity
@@ -1263,6 +1326,14 @@ public class LeagueEventSyncService
         };
 
         _db.Events.Add(newEvent);
+        if (!string.IsNullOrEmpty(newEvent.ExternalId))
+        {
+            // Register the pending row so a duplicate id later in this
+            // season's response updates it instead of inserting a second
+            // copy — the old per-event DB lookup could never see rows
+            // still waiting on the per-season SaveChanges.
+            existingByExternalId.TryAdd(newEvent.ExternalId!, newEvent);
+        }
         result.NewCount++;
 
         _logger.LogDebug("[League Event Sync] Added event: {EventTitle} on {EventDate}",
