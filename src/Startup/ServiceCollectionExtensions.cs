@@ -156,6 +156,11 @@ public static class ServiceCollectionExtensions
         // policy below (2s+4s+8s+16s = 30s of backoff alone) to
         // actually fire its full sequence on transient 5xx, instead
         // of being clipped by the request timeout half-way through.
+        // Outermost handler that tallies one hub HTTP call per logical
+        // request into the ambient SyncMetrics counter (registered before
+        // the Polly policy below so retries aren't double-counted).
+        services.AddTransient<SyncHttpCountingHandler>();
+
         services.AddHttpClient<SportarrApiClient>()
             .ConfigurePrimaryHttpMessageHandler(() => new SocketsHttpHandler
             {
@@ -167,6 +172,7 @@ public static class ServiceCollectionExtensions
                 client.Timeout = TimeSpan.FromSeconds(90);
                 client.DefaultRequestHeaders.UserAgent.ParseAdd("Sportarr/1.0");
             })
+            .AddHttpMessageHandler<SyncHttpCountingHandler>()
             // Retry transient 5xx / network errors with a short exponential
             // backoff (2s, 4s, 8s). Retry 429 separately with a much longer
             // base (8s, 16s, 32s, 64s) and honor the server's Retry-After
@@ -355,8 +361,14 @@ public static class ServiceCollectionExtensions
 
     public static IServiceCollection AddSportarrDatabase(this IServiceCollection services, string dbPath)
     {
+        // Single shared interceptor instance. It only does work inside a
+        // SyncMetrics measured block (one AsyncLocal read otherwise), so it
+        // is safe to attach to every context including the request path.
+        var commandCounter = new Sportarr.Api.Data.CommandCountingInterceptor();
+
         services.AddDbContext<SportarrDbContext>(options =>
             options.UseSqlite($"Data Source={dbPath}")
+                   .AddInterceptors(commandCounter)
                    .ConfigureWarnings(w => w
                        .Ignore(Microsoft.EntityFrameworkCore.Diagnostics.RelationalEventId.AmbientTransactionWarning)
                        .Ignore(Microsoft.EntityFrameworkCore.Diagnostics.RelationalEventId.PendingModelChangesWarning)
@@ -364,6 +376,7 @@ public static class ServiceCollectionExtensions
 
         services.AddDbContextFactory<SportarrDbContext>(options =>
             options.UseSqlite($"Data Source={dbPath}")
+                   .AddInterceptors(commandCounter)
                    .ConfigureWarnings(w => w
                        .Ignore(Microsoft.EntityFrameworkCore.Diagnostics.RelationalEventId.AmbientTransactionWarning)
                        .Ignore(Microsoft.EntityFrameworkCore.Diagnostics.RelationalEventId.PendingModelChangesWarning)

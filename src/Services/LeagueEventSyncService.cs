@@ -57,6 +57,13 @@ public class LeagueEventSyncService
     {
         var result = new LeagueEventSyncResult { LeagueId = leagueId };
 
+        // Objective sync diagnostics. Counts DB round-trips and hub HTTP
+        // calls issued on this async flow so the [Sync Metrics] line below
+        // gives a measurable baseline (and proves later optimizations, e.g.
+        // the per-season N+1 lookup elimination, with real numbers rather
+        // than assertions). No-op cost outside this block.
+        using var measure = Sportarr.Api.Helpers.SyncMetrics.BeginMeasure();
+
         _logger.LogInformation("[League Event Sync] Starting sync for league ID: {LeagueId}", leagueId);
 
         // Get league from database with monitored teams
@@ -633,6 +640,15 @@ public class LeagueEventSyncService
         result.Success = true;
         result.Message = $"Synced {result.NewCount} new events, updated {result.UpdatedCount} events, skipped {result.SkippedCount} duplicates";
         _logger.LogInformation("[League Event Sync] Completed: {Message}", result.Message);
+
+        // Baseline/proof line. eventsProcessed is the work the per-event
+        // loop actually touched; dbCommands divided by eventsProcessed is
+        // the N+1 ratio we expect to collapse toward ~1-per-season.
+        var eventsProcessed = result.NewCount + result.UpdatedCount + result.SkippedCount;
+        _logger.LogInformation(
+            "[Sync Metrics] league={LeagueName} seasons={Seasons} eventsProcessed={Events} removed={Removed} dbCommands={DbCommands} httpCalls={HttpCalls} elapsedMs={ElapsedMs}",
+            league.Name, seasons?.Count ?? 0, eventsProcessed, result.RemovedCount,
+            measure.DbCommands, measure.HttpCalls, measure.ElapsedMs);
 
         return result;
     }
