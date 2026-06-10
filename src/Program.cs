@@ -1,4 +1,5 @@
 using Microsoft.EntityFrameworkCore;
+using Microsoft.AspNetCore.Authentication;
 using Microsoft.AspNetCore.Mvc;
 using Sportarr.Api.Data;
 using Sportarr.Api.Endpoints;
@@ -569,10 +570,14 @@ app.Use(async (context, next) =>
                 // brackets, so embedding the serialized object inside a script
                 // tag cannot be closed early by a value containing a literal
                 // closing tag.
+                // Same rule as /initialize.json: never embed the master API key in the
+                // page for an unauthenticated caller when UI auth is enabled.
+                var db = context.RequestServices.GetRequiredService<SportarrDbContext>();
+                var exposeApiKey = await ShouldExposeApiKeyAsync(context, db);
                 var initialState = new
                 {
                     apiRoot = "",
-                    apiKey = config.ApiKey,
+                    apiKey = exposeApiKey ? config.ApiKey : "",
                     release = Sportarr.Api.Version.GetFullVersion(),
                     version = Sportarr.Api.Version.GetFullVersion(),
                     instanceName = "Sportarr",
@@ -606,7 +611,7 @@ app.UseDefaultFiles();
 app.UseStaticFiles();
 
 // Initialize endpoint (for frontend) - keep for SPA compatibility
-app.MapGet("/initialize.json", async (Sportarr.Api.Services.ConfigService configService) =>
+app.MapGet("/initialize.json", async (HttpContext httpContext, Sportarr.Api.Services.ConfigService configService, SportarrDbContext db) =>
 {
     // Get API key from config.xml (same source that authentication uses)
     var config = await configService.GetConfigAsync();
@@ -618,10 +623,15 @@ app.MapGet("/initialize.json", async (Sportarr.Api.Services.ConfigService config
             urlBase = "/" + urlBase;
         urlBase = urlBase.TrimEnd('/');
     }
+    // Only expose the master API key to callers who are allowed to have it. When UI auth
+    // is enabled (forms/basic/external), an unauthenticated client must NOT be able to read
+    // the key here, or it would defeat the auth the user turned on. The web UI receives the
+    // key after a successful login (the session cookie authenticates this same request).
+    var exposeApiKey = await ShouldExposeApiKeyAsync(httpContext, db);
     return Results.Json(new
     {
         apiRoot = "", // Empty since all API routes already start with /api
-        apiKey = config.ApiKey,
+        apiKey = exposeApiKey ? config.ApiKey : "",
         release = Sportarr.Api.Version.GetFullVersion(),
         version = Sportarr.Api.Version.GetFullVersion(),
         instanceName = "Sportarr",
@@ -633,6 +643,41 @@ app.MapGet("/initialize.json", async (Sportarr.Api.Services.ConfigService config
         isProduction = !app.Environment.IsDevelopment()
     });
 });
+
+// Decide whether the master API key may be returned to the current caller.
+// Safe to expose when UI auth is disabled ("none" – there is no auth boundary to defeat),
+// or when the request itself is already authenticated via the API key or a Forms session.
+static async Task<bool> ShouldExposeApiKeyAsync(HttpContext context, SportarrDbContext db)
+{
+    var authMethod = "none";
+    var appSettings = await db.AppSettings.FirstOrDefaultAsync();
+    if (appSettings != null)
+    {
+        try
+        {
+            authMethod = JsonSerializer.Deserialize<SecuritySettings>(appSettings.SecuritySettings)?.AuthenticationMethod ?? "none";
+        }
+        catch
+        {
+            // Treat malformed settings as auth-enabled (fail closed) below.
+            authMethod = "unknown";
+        }
+    }
+
+    if (authMethod == "none")
+    {
+        return true;
+    }
+
+    var apiResult = await context.AuthenticateAsync("API");
+    if (apiResult.Succeeded)
+    {
+        return true;
+    }
+
+    var formsResult = await context.AuthenticateAsync("Forms");
+    return formsResult.Succeeded;
+}
 
 // Health check
 app.MapGet("/ping", () => Results.Ok("pong"));

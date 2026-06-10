@@ -113,7 +113,12 @@ public static class ServiceCollectionExtensions
                 AllowAutoRedirect = true,
                 MaxAutomaticRedirections = 10,
                 PooledConnectionLifetime = TimeSpan.FromMinutes(1),
-                PooledConnectionIdleTimeout = TimeSpan.FromSeconds(30)
+                PooledConnectionIdleTimeout = TimeSpan.FromSeconds(30),
+                // SSRF guard: the stream proxy is reachable anonymously and fetches
+                // caller-supplied URLs, so validate the actual IP on every connection
+                // (initial request + each redirect hop) and refuse internal targets.
+                ConnectCallback = async (ctx, ct) =>
+                    await Sportarr.Api.Helpers.SsrfGuard.ConnectValidatedAsync(ctx.DnsEndPoint, ct)
             })
             .ConfigureHttpClient(client =>
             {
