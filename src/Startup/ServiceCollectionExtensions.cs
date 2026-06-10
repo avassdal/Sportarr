@@ -347,6 +347,7 @@ public static class ServiceCollectionExtensions
         services.AddHostedService<FileWatcherService>();
         services.AddHostedService<EventMappingSyncBackgroundService>();
         services.AddHostedService<LeagueEventAutoSyncService>();
+        services.AddHostedService<HubChangesPollerService>();
         services.AddHostedService<DvrSchedulerService>();
 
         services.AddSingleton<DvrAutoSchedulerService>();

@@ -1069,6 +1069,96 @@ public class SportarrApiClient
     }
 
     #endregion
+
+    #region Changes Feed
+
+    /// <summary>
+    /// Poll the hub's entity changes feed. Returns ordered change records
+    /// newer than <paramref name="since"/> plus the cursor to store for the
+    /// next poll. A response with <c>Resync == true</c> means the cursor is
+    /// unusable (brand-new consumer, or it predates the feed's retention
+    /// window) — the caller should rely on its normal full-sync safety net
+    /// and start polling from <c>Next</c>.
+    /// </summary>
+    public async Task<ChangesFeedResponse?> GetChangesAsync(long since, int limit = 500)
+    {
+        try
+        {
+            var url = $"{_apiBaseUrl}/changes?since={since}&limit={limit}";
+            _logger.LogDebug("[SportarrAPI] Polling changes feed: {Url}", url);
+
+            using var response = await _httpClient.GetAsync(url);
+
+            if (!response.IsSuccessStatusCode)
+            {
+                _logger.LogWarning("[SportarrAPI] Changes feed poll failed: HTTP {StatusCode}", response.StatusCode);
+                return null;
+            }
+
+            var json = await response.Content.ReadAsStringAsync();
+            return JsonSerializer.Deserialize<ChangesFeedResponse>(json, _jsonOptions);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "[SportarrAPI] Failed to poll changes feed (since={Since})", since);
+            return null;
+        }
+    }
+
+    #endregion
+}
+
+/// <summary>
+/// Response from the hub entity changes feed.
+/// </summary>
+public class ChangesFeedResponse
+{
+    [JsonPropertyName("changes")]
+    public List<ChangeRecord>? Changes { get; set; }
+
+    /// <summary>Cursor to store and send as `since` on the next poll.</summary>
+    [JsonPropertyName("next")]
+    public long Next { get; set; }
+
+    /// <summary>True when the page was truncated at `limit` — poll again immediately.</summary>
+    [JsonPropertyName("more")]
+    public bool More { get; set; }
+
+    /// <summary>
+    /// True when the supplied cursor is unusable (new consumer or pruned
+    /// past). Full correctness comes from the normal background sync; store
+    /// <see cref="Next"/> and resume polling from there.
+    /// </summary>
+    [JsonPropertyName("resync")]
+    public bool Resync { get; set; }
+}
+
+/// <summary>
+/// One change record from the hub feed.
+/// </summary>
+public class ChangeRecord
+{
+    [JsonPropertyName("seq")]
+    public long Seq { get; set; }
+
+    /// <summary>Entity kind: "event" or "league".</summary>
+    [JsonPropertyName("entity")]
+    public string? Entity { get; set; }
+
+    /// <summary>The changed entity's hub short_id (ev-XXXXXX / lg-XXXXXX).</summary>
+    [JsonPropertyName("id")]
+    public string? Id { get; set; }
+
+    /// <summary>Owning league short_id — what consumers key refreshes on.</summary>
+    [JsonPropertyName("league")]
+    public string? League { get; set; }
+
+    /// <summary>"created", "updated" or "deleted".</summary>
+    [JsonPropertyName("change")]
+    public string? Change { get; set; }
+
+    [JsonPropertyName("ts")]
+    public DateTime? Ts { get; set; }
 }
 
 /// <summary>

@@ -958,6 +958,25 @@ public static class DatabaseInitializer
             Console.WriteLine($"[Sportarr] Warning: Could not verify AppSettings.IndexerMinimumAgeMinutes column: {ex.Message}");
         }
 
+        // Ensure HubChangesCursor column exists in AppSettings (hub changes
+        // feed poller). Stores the last consumed feed sequence so polling
+        // resumes across restarts.
+        try
+        {
+            var checkHubCursorSql = "SELECT COUNT(*) FROM pragma_table_info('AppSettings') WHERE name='HubChangesCursor'";
+            var hubCursorExists = db.Database.SqlQueryRaw<int>(checkHubCursorSql).AsEnumerable().FirstOrDefault();
+            if (hubCursorExists == 0)
+            {
+                Console.WriteLine("[Sportarr] AppSettings.HubChangesCursor column missing - adding it now...");
+                db.Database.ExecuteSqlRaw("ALTER TABLE \"AppSettings\" ADD COLUMN \"HubChangesCursor\" INTEGER NOT NULL DEFAULT 0");
+                Console.WriteLine("[Sportarr] AppSettings.HubChangesCursor column added successfully");
+            }
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"[Sportarr] Warning: Could not verify AppSettings.HubChangesCursor column: {ex.Message}");
+        }
+
         // Ensure PendingReleases table exists (delay-profile feature).
         // Required by RssSyncService and PendingReleaseReaperService - without
         // this table both services would crash on first run for legacy DBs.
