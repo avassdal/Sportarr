@@ -161,6 +161,13 @@ public class HubChangesPollerService : BackgroundService
             }
         }
 
+        // One line per cycle even when idle. A silent poll is
+        // indistinguishable from a dead poller in the logs, which makes
+        // soak-testing and support threads needlessly hard.
+        _logger.LogInformation(
+            "[Changes Poller] Poll complete: {Changes} new change(s), cursor {From} -> {To}",
+            totalChanges, settings.HubChangesCursor, cursor);
+
         if (work.Count > 0)
         {
             // Only leagues this install actually has (and monitors) matter.
