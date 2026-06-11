@@ -993,8 +993,8 @@ export default function LeagueDetailPage() {
       const response = await apiClient.post(`/leagues/${id}/refresh-events`, { scope });
 
       if (response.data.queued) {
-        const scopeLabel = scope === 'full' ? 'all seasons' : 'checking hub for changes';
-        toast.info('Refresh queued', {
+        const scopeLabel = scope === 'full' ? 'Deep Sync (all seasons)' : 'Quick Sync';
+        toast.info('Sync queued', {
           description: `${league?.name}: ${scopeLabel}. Progress in the status bar (bottom-left).`,
         });
 
@@ -1006,7 +1006,7 @@ export default function LeagueDetailPage() {
         queryClient.invalidateQueries({ queryKey: ['league-events', id] });
         queryClient.invalidateQueries({ queryKey: ['leagues'] });
       } else {
-        toast.error('Failed to queue refresh', {
+        toast.error('Failed to queue sync', {
           description: response.data.message || 'Could not queue refresh task',
         });
       }
@@ -1014,12 +1014,12 @@ export default function LeagueDetailPage() {
       // 429 cooldown gate from the backend — surface the retry-after.
       const axiosErr = error as { response?: { status?: number; data?: { error?: string; retryAfterSeconds?: number } } };
       if (axiosErr.response?.status === 429) {
-        toast.warning('Refresh on cooldown', {
+        toast.warning('Sync on cooldown', {
           description: axiosErr.response.data?.error || 'Try again shortly.',
         });
       } else {
         console.error('Refresh events error:', error);
-        toast.error('Failed to queue refresh', {
+        toast.error('Failed to queue sync', {
           description: 'An error occurred while queueing the refresh task.',
         });
       }
@@ -1258,10 +1258,10 @@ export default function LeagueDetailPage() {
               <button
                 onClick={() => setIsRefreshScopeModalOpen(true)}
                 className={BUTTON_INFO}
-                title="Refresh events from Sportarr API"
+                title="Sync events from Sportarr API"
               >
                 <ArrowPathIcon className="h-4 w-4" />
-                Refresh
+                Sync
               </button>
               <button
                 onClick={handleScanFiles}

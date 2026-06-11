@@ -69,10 +69,10 @@ export default function RefreshScopeModal({
                     </div>
                     <div className="flex-1 min-w-0">
                       <Dialog.Title as="h3" className="text-base md:text-lg font-bold text-white mb-1">
-                        Refresh {leagueName ?? 'League'}
+                        Sync {leagueName ?? 'League'}
                       </Dialog.Title>
                       <p className="text-xs md:text-sm text-gray-400">
-                        Pick how much of the league to re-sync from the Sportarr API.
+                        Pick how to sync this league with the Sportarr API.
                       </p>
                     </div>
                   </div>
@@ -86,7 +86,7 @@ export default function RefreshScopeModal({
                         <ClockIcon className="w-5 h-5 text-red-400 flex-shrink-0 mt-0.5" />
                         <div className="flex-1 min-w-0">
                           <div className="text-sm md:text-base font-semibold text-white mb-0.5">
-                            Check for changes now
+                            Quick Sync
                             <span className="ml-2 text-xs font-normal text-green-400">recommended</span>
                           </div>
                           <p className="text-xs text-gray-400">
@@ -104,7 +104,7 @@ export default function RefreshScopeModal({
                         <ExclamationTriangleIcon className="w-5 h-5 text-yellow-400 flex-shrink-0 mt-0.5" />
                         <div className="flex-1 min-w-0">
                           <div className="text-sm md:text-base font-semibold text-white mb-0.5">
-                            All seasons (full history)
+                            Deep Sync
                           </div>
                           <p className="text-xs text-gray-400">
                             Re-syncs every season this league has on the Sportarr API, including decades of historical events. Can take a few minutes. Use this for recovery — a restored backup, an install that was offline for weeks, or data you suspect has drifted.

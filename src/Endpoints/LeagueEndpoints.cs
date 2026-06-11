@@ -1837,8 +1837,8 @@ app.MapPost("/api/leagues/{id:int}/refresh-events", async (
         // blind every-season walk for recovery. Label accordingly so the
         // task list reflects what actually runs.
         var taskLabel = fullHistoricalSync
-            ? (league?.Name != null ? $"Refresh {league.Name} (full history)" : $"Refresh league #{id} (full history)")
-            : "Check hub for changes";
+            ? (league?.Name != null ? $"Deep Sync {league.Name}" : $"Deep Sync league #{id}")
+            : "Quick Sync";
 
         var taskBody = JsonSerializer.Serialize(new
         {
