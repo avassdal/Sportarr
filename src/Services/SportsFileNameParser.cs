@@ -470,6 +470,15 @@ public class SportsFileNameParser
     // and without pulling the year out, match confidence caps below the
     // threshold and RSS sync silently drops the release.
     private static readonly Regex SeasonEpisodeYearPattern = new(@"[Ss](?<year>20[12]\d)[Ee]\d+", RegexOptions.Compiled);
+    // {Year}x{Round} season marker where the season is the year and the round
+    // follows immediately after an 'x' (e.g. "2026x02" = 2026 season, round 2).
+    // Scene releases use it for round-based sports -- Sky's Formula 1 feed is
+    // one example (Formula.1.2026x02.China.Race.SkyF1HD.1080p). YearOnlyPattern
+    // misses it because the 'x' joining the year and round is a word character,
+    // so the \b after the year never fires -- the year stays unextracted, the
+    // year-match bonus is lost, and the release scores below the confidence
+    // threshold and gets dropped.
+    private static readonly Regex SeasonRoundYearPattern = new(@"\b(?<year>20[12]\d)x(?<round>\d{1,2})\b", RegexOptions.Compiled | RegexOptions.IgnoreCase);
 
     public SportsFileNameParser(ILogger<SportsFileNameParser> logger)
     {
@@ -609,8 +618,31 @@ public class SportsFileNameParser
                     }
                     else
                     {
-                        _logger.LogDebug("[SportsFileNameParser] No date/year found in '{Filename}' (cleanName: '{CleanName}')",
-                            filename, cleanName);
+                        // Fallback: {Year}x{Round} season marker (e.g.
+                        // "2026x02"). The 'x' joining the year and round is a
+                        // word character, so neither YearOnlyPattern nor the
+                        // SxxxxExx marker above can pull the year out. Extract
+                        // the year (and the round, when no sport pattern has
+                        // already supplied one) so the release earns the
+                        // year-match bonus instead of being dropped below the
+                        // confidence threshold.
+                        var xRoundMatch = SeasonRoundYearPattern.Match(cleanName);
+                        if (xRoundMatch.Success && int.TryParse(xRoundMatch.Groups["year"].Value, out var xYear))
+                        {
+                            result.EventYear = xYear;
+                            if (!result.RoundNumber.HasValue &&
+                                int.TryParse(xRoundMatch.Groups["round"].Value, out var xRound))
+                            {
+                                result.RoundNumber = xRound;
+                            }
+                            _logger.LogDebug("[SportsFileNameParser] Extracted year {Year} (round {Round}) from YYYYxNN marker in '{Filename}'",
+                                xYear, result.RoundNumber?.ToString() ?? "n/a", filename);
+                        }
+                        else
+                        {
+                            _logger.LogDebug("[SportsFileNameParser] No date/year found in '{Filename}' (cleanName: '{CleanName}')",
+                                filename, cleanName);
+                        }
                     }
                 }
             }
