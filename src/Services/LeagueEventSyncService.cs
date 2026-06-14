@@ -386,13 +386,42 @@ public class LeagueEventSyncService
                 }
             }
 
+            // Preload the season's local events keyed by a date+title
+            // signature. ProcessEvent uses this as a last-resort matcher: when
+            // the upstream re-identifies an event (its short_id AND TheSportsDB
+            // id both miss the local ExternalId — e.g. the hub flipped the
+            // wire id but stopped emitting the TheSportsDB cross-reference),
+            // pairing on date+title lets us update the existing row in place
+            // instead of deleting it and inserting a fresh one. The delete +
+            // recreate is what orphaned scheduled DVR recordings, which the
+            // auto-scheduler then cancelled as "Event was deleted". Built once
+            // per season; the rows come back tracked, so the same instances are
+            // reused by existingByExternalId and the cleanup pass below.
+            var localByDateTitle = new Dictionary<string, List<Event>>(StringComparer.Ordinal);
+            foreach (var local in await _db.Events
+                         .Where(e => e.LeagueId == league.Id && e.Season == season && e.ExternalId != null)
+                         .ToListAsync())
+            {
+                var sig = BuildEventMatchSignature(local.EventDate, local.Title);
+                if (!localByDateTitle.TryGetValue(sig, out var bucket))
+                {
+                    bucket = new List<Event>();
+                    localByDateTitle[sig] = bucket;
+                }
+                bucket.Add(local);
+            }
+            // Tracks local rows already adopted by an API event this season so a
+            // second unmatched API event can't claim the same row twice.
+            var adoptedLocalEventIds = new HashSet<int>();
+
             // Process each event
             foreach (var apiEvent in events)
             {
                 try
                 {
                     ProcessEvent(apiEvent, league, result, currentSeason, apiEpisodeMap,
-                        existingByExternalId, teamsByExternalId, scheduledRecordingsByEventId);
+                        existingByExternalId, teamsByExternalId, scheduledRecordingsByEventId,
+                        localByDateTitle, apiIds, adoptedLocalEventIds);
                 }
                 catch (Exception ex)
                 {
@@ -521,8 +550,56 @@ public class LeagueEventSyncService
 
             if (orphanedEvents.Any())
             {
+                // Safety net for the re-identification case the in-place
+                // matcher (ProcessEvent Step 4) couldn't pair — e.g. the title
+                // drifted as well as the id. Index this season's freshly
+                // created rows (Id == 0 until the SaveChanges below assigns one,
+                // so this is precisely "new this sync") by their date+title
+                // signature. If an orphan that carries scheduled DVR recordings
+                // matches a brand-new replacement, move the recordings onto the
+                // replacement before deleting the orphan, so a re-identified
+                // fixture never leaves the recording stranded for the
+                // auto-scheduler to cancel as "Event was deleted".
+                var replacementsBySignature = new Dictionary<string, Event>(StringComparer.Ordinal);
+                foreach (var candidate in existingByExternalId.Values)
+                {
+                    if (candidate.Id != 0) continue; // only rows added this sync
+                    var sig = BuildEventMatchSignature(candidate.EventDate, candidate.Title);
+                    replacementsBySignature.TryAdd(sig, candidate);
+                }
+
                 foreach (var orphan in orphanedEvents)
                 {
+                    if (scheduledRecordingsByEventId.TryGetValue(orphan.Id, out var orphanRecordings) &&
+                        orphanRecordings.Count > 0)
+                    {
+                        var sig = BuildEventMatchSignature(orphan.EventDate, orphan.Title);
+                        if (replacementsBySignature.TryGetValue(sig, out var replacement))
+                        {
+                            foreach (var rec in orphanRecordings)
+                            {
+                                // Re-point via the navigation property; EF
+                                // propagates the replacement's generated key to
+                                // rec.EventId on SaveChanges (the replacement is
+                                // a tracked, not-yet-persisted row).
+                                rec.Event = replacement;
+
+                                // Keep the recording window aligned to the
+                                // replacement's time, preserving its duration.
+                                if (rec.Status == DvrRecordingStatus.Scheduled &&
+                                    rec.ScheduledStart != replacement.EventDate)
+                                {
+                                    var drift = replacement.EventDate - rec.ScheduledStart;
+                                    rec.ScheduledStart = replacement.EventDate;
+                                    rec.ScheduledEnd += drift;
+                                }
+                            }
+                            _logger.LogInformation(
+                                "[League Event Sync] Re-linked {Count} scheduled recording(s) from re-identified event '{Title}' (S{Season}) to its replacement instead of orphaning them",
+                                orphanRecordings.Count, orphan.Title, season);
+                        }
+                    }
+
                     if (orphan.HasFile || orphan.Files.Any())
                     {
                         _logger.LogWarning("[League Event Sync] Removing cancelled event '{Title}' (S{Season}) which has {FileCount} file(s) on disk - files left for manual cleanup",
@@ -975,7 +1052,10 @@ public class LeagueEventSyncService
         Dictionary<string, int>? apiEpisodeMap,
         Dictionary<string, Event> existingByExternalId,
         Dictionary<string, Team> teamsByExternalId,
-        Dictionary<int, List<DvrRecording>> scheduledRecordingsByEventId)
+        Dictionary<int, List<DvrRecording>> scheduledRecordingsByEventId,
+        Dictionary<string, List<Event>> localByDateTitle,
+        HashSet<string> apiIds,
+        HashSet<int> adoptedLocalEventIds)
     {
         // Two-pass match against the preloaded existence dictionary (one
         // bulk query per season replaces the former one-to-two DB
@@ -1013,6 +1093,51 @@ public class LeagueEventSyncService
                     apiEvent.TsdbId, apiEvent.ExternalId, apiEvent.Title);
                 existingEvent.ExternalId = apiEvent.ExternalId;
                 existingByExternalId.TryAdd(apiEvent.ExternalId!, existingEvent);
+            }
+        }
+
+        // Step 4 (last resort): neither the short_id nor the TheSportsDB id
+        // paired. Before treating this as a brand-new event, try to pair it
+        // with an existing local row by date + title. This rescues events the
+        // upstream re-identified without supplying a TheSportsDB cross-reference
+        // (the case Step 2 can't catch): without it the unmatched local row is
+        // deleted by the cleanup pass and any scheduled DVR recording pinned to
+        // it is orphaned, which the auto-scheduler then cancels as "Event was
+        // deleted". We only adopt a row that ISN'T claimed by some other event
+        // in this same response — its ExternalId must be absent from apiIds —
+        // so we rescue a would-be orphan rather than steal a row another event
+        // owns. Ambiguous matches (more than one adoptable candidate, e.g. a
+        // doubleheader) are skipped so we never guess.
+        if (existingEvent == null && localByDateTitle.Count > 0)
+        {
+            var signature = BuildEventMatchSignature(apiEvent.EventDate, apiEvent.Title);
+            if (localByDateTitle.TryGetValue(signature, out var candidates))
+            {
+                var adoptable = candidates
+                    .Where(c => !adoptedLocalEventIds.Contains(c.Id))
+                    .Where(c => string.IsNullOrEmpty(c.ExternalId) || !apiIds.Contains(c.ExternalId!))
+                    .ToList();
+
+                if (adoptable.Count == 1)
+                {
+                    existingEvent = adoptable[0];
+                    adoptedLocalEventIds.Add(existingEvent.Id);
+                    _logger.LogInformation(
+                        "[League Event Sync] Re-identified event by date+title: local row {LocalId} (old id {OldId}) adopted as hub id {NewId} ('{Title}') — preserving DVR links instead of delete + recreate",
+                        existingEvent.Id, existingEvent.ExternalId, apiEvent.ExternalId, apiEvent.Title);
+
+                    if (!string.IsNullOrEmpty(apiEvent.ExternalId))
+                    {
+                        existingEvent.ExternalId = apiEvent.ExternalId;
+                        existingByExternalId.TryAdd(apiEvent.ExternalId!, existingEvent);
+                    }
+                }
+                else if (adoptable.Count > 1)
+                {
+                    _logger.LogDebug(
+                        "[League Event Sync] Skipped date+title rescue for '{Title}' on {Date:yyyy-MM-dd}: {Count} ambiguous local candidates",
+                        apiEvent.Title, apiEvent.EventDate, adoptable.Count);
+                }
             }
         }
 
@@ -1492,6 +1617,26 @@ public class LeagueEventSyncService
         }
 
         return images;
+    }
+
+    /// <summary>
+    /// Build a stable "this is the same fixture" key from an event's calendar
+    /// day (UTC) plus its normalized title. Used as the last-resort matcher
+    /// when an event's upstream identifier changed and neither the hub short_id
+    /// nor the TheSportsDB id pairs to a local row. Matching on the day rather
+    /// than the full timestamp tolerates the common case where the upstream
+    /// later refines a midnight placeholder to the real kickoff time, and the
+    /// title is normalized (trimmed, lower-cased, whitespace-collapsed) so
+    /// cosmetic punctuation/spacing drift doesn't break the pairing.
+    /// </summary>
+    private static string BuildEventMatchSignature(DateTime eventDate, string? title)
+    {
+        var day = eventDate.Date.ToString("yyyy-MM-dd", System.Globalization.CultureInfo.InvariantCulture);
+        var normalized = string.Join(
+            ' ',
+            (title ?? string.Empty).ToLowerInvariant()
+                .Split((char[]?)null, StringSplitOptions.RemoveEmptyEntries));
+        return $"{day}|{normalized}";
     }
 
     /// <summary>
