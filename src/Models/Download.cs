@@ -179,8 +179,7 @@ public enum IndexerType
     Torznab,
     Newznab,
     Rss,
-    Torrent,
-    BroadcasTheNet
+    Torrent
 }
 
 /// <summary>

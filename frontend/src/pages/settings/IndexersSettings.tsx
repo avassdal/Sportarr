@@ -109,13 +109,6 @@ const indexerTemplates: IndexerTemplate[] = [
     protocol: 'torrent',
     description: 'Plain RSS 2.0 feed (poll-only, no on-demand search). Use this for sites with an RSS feed but no Torznab/Newznab API.',
     fields: ['baseUrl', 'cookie', 'minimumSeeders', 'allowZeroSize', 'seedRatio', 'seedTime']
-  },
-  {
-    name: 'BroadcasTheNet',
-    implementation: 'BroadcasTheNet',
-    protocol: 'torrent',
-    description: 'BroadcasTheNet (BTN) - Private TV tracker with sports content support via JSON-RPC API.',
-    fields: ['baseUrl', 'apiKey', 'minimumSeeders', 'seedRatio', 'seedTime']
   }
 ];
 
@@ -169,9 +162,9 @@ export default function IndexersSettings() {
       const apiTags = indexer.tags;
 
       // Determine protocol based on implementation type
-      // Torrent implementations: Torznab, Torrent, Nyaa, TorrentLeech, IPTorrents, FileList, Rss, BroadcasTheNet
+      // Torrent implementations: Torznab, Torrent, Nyaa, TorrentLeech, IPTorrents, FileList, Rss
       // Usenet implementations: Newznab
-      const isTorrent = ['Torznab', 'Torrent', 'Nyaa', 'TorrentLeech', 'IPTorrents', 'FileList', 'Rss', 'BroadcasTheNet']
+      const isTorrent = ['Torznab', 'Torrent', 'Nyaa', 'TorrentLeech', 'IPTorrents', 'FileList', 'Rss']
         .some(impl => indexer.implementation.toLowerCase().includes(impl.toLowerCase()));
 
       return {
