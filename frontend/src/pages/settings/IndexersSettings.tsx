@@ -149,7 +149,7 @@ export default function IndexersSettings() {
     return apiIndexers.map(indexer => {
       const getField = (name: string) => indexer.fields?.find(f => f.name === name)?.value;
       const baseUrl = getField('baseUrl') as string || '';
-      const apiPath = getField('apiPath') as string || '/api';
+      const apiPath = getField('apiPath') as string || (indexer.implementation === 'BroadcasTheNet' ? '' : '/api');
       const apiKey = getField('apiKey') as string || '';
       const categories = getField('categories') as string || '';
       const animeCategories = getField('animeCategories') as string;
@@ -353,6 +353,7 @@ export default function IndexersSettings() {
       enabled: true,
       priority: 25,
       baseUrl: '',
+      apiPath: template.implementation === 'BroadcasTheNet' ? '' : '/api',
       apiKey: '',
       categories: [],
       minimumSeeders: template.protocol === 'torrent' ? 1 : undefined,
@@ -466,7 +467,7 @@ export default function IndexersSettings() {
   const toApiFormat = (indexer: Partial<Indexer>): Partial<ApiIndexer> => {
     const fields: { name: string; value: string | string[] }[] = [
       { name: 'baseUrl', value: indexer.baseUrl || '' },
-      { name: 'apiPath', value: indexer.apiPath || '/api' },
+      { name: 'apiPath', value: indexer.implementation === 'BroadcasTheNet' ? '' : (indexer.apiPath || '/api') },
       { name: 'apiKey', value: indexer.apiKey || '' },
       { name: 'categories', value: indexer.categories?.join(',') || '' },
       { name: 'minimumSeeders', value: String(indexer.minimumSeeders || 1) },
@@ -777,6 +778,7 @@ export default function IndexersSettings() {
               </p>
             </div>
 
+            {formData.implementation !== 'BroadcasTheNet' && (
             <div>
               <label className="block text-sm font-medium text-gray-300 mb-2">API Path</label>
               <input
@@ -790,6 +792,7 @@ export default function IndexersSettings() {
                 API path for the indexer (usually /api for Newznab/Torznab)
               </p>
             </div>
+            )}
           </div>
         )}
 
