@@ -688,8 +688,8 @@ public class ReleaseMatchingService
 
             // VALIDATION 6b: Motorsport round number validation
             // For motorsport events, Round 20 release should NOT match Round 22 event
-            // Extract round from release title and compare to event's Round field
-            var releaseRound = ExtractRoundNumber(release.Title);
+            // Extract round from already-parsed result (handles underscores correctly) or fall back to re-parsing
+            var releaseRound = parseResult.RoundNumber ?? ExtractRoundNumber(release.Title);
             var eventRound = !string.IsNullOrEmpty(evt.Round) ? ExtractRoundNumber($"Round {evt.Round}") : null;
 
             if (releaseRound.HasValue && eventRound.HasValue)
