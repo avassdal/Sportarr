@@ -199,7 +199,9 @@ app.MapGet("/api/settings", async (ConfigService configService, SportarrDbContex
 
         // Search Queue Management (Huntarr-style)
         MaxDownloadQueueSize = config.MaxDownloadQueueSize,
+#pragma warning disable CS0618
         SearchSleepDuration = config.SearchSleepDuration,
+#pragma warning restore CS0618
 
         // Indexer Options (advanced settings)
         IndexerRetention = config.IndexerRetention,
@@ -442,7 +444,9 @@ app.MapPut("/api/settings", async (AppSettings updatedSettings, ConfigService co
 
         // Search Queue Management (Huntarr-style)
         config.MaxDownloadQueueSize = updatedSettings.MaxDownloadQueueSize;
+#pragma warning disable CS0618
         config.SearchSleepDuration = updatedSettings.SearchSleepDuration;
+#pragma warning restore CS0618
 
         // Indexer Options (advanced settings)
         config.IndexerRetention = updatedSettings.IndexerRetention;

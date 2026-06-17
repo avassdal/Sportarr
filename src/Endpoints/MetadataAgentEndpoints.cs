@@ -145,7 +145,7 @@ public static class MetadataAgentEndpoints
             if (evt == null)
                 return Results.Ok(new { error = "Episode not found" });
 
-            var cast = await apiClient.GetEventCastAsync(evt.ExternalId);
+            var cast = await apiClient.GetEventCastAsync(evt.ExternalId!);
             return Results.Ok(ToEpisode(evt, cast));
         });
 
@@ -179,7 +179,7 @@ public static class MetadataAgentEndpoints
                 return Results.Ok(new { error = "Episode not found" });
 
             var seasonLabel = events.Select(e => e.Season).FirstOrDefault(s => !string.IsNullOrEmpty(s));
-            var cast = await apiClient.GetEventCastAsync(evt.ExternalId);
+            var cast = await apiClient.GetEventCastAsync(evt.ExternalId!);
 
             return Results.Ok(new
             {
@@ -277,7 +277,7 @@ public static class MetadataAgentEndpoints
         id = e.ExternalId,
         title = e.Title,
         summary = e.Description,
-        thumb_url = e.Images != null ? e.Images.FirstOrDefault() : null,
+        thumb_url = e.Images?.FirstOrDefault(),
         air_date = e.EventDate.ToString("yyyy-MM-dd"),
         broadcast_date = e.BroadcastDate?.ToString("yyyy-MM-dd"),
         season_number = e.SeasonNumber,
@@ -291,7 +291,7 @@ public static class MetadataAgentEndpoints
         away_team = e.AwayTeamName,
         sport = e.Sport,
         cast = cast == null
-            ? Array.Empty<object>()
+            ? (object[])[]
             : cast.Select(c => new
             {
                 name = c.Name,

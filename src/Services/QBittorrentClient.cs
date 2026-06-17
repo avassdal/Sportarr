@@ -1628,7 +1628,7 @@ public class QBittorrentClient
             {
                 if (hasSessionCookie)
                 {
-                    _cookie = cookies.FirstOrDefault();
+                    _cookie = cookies?.FirstOrDefault();
                     _httpClient.DefaultRequestHeaders.Add("Cookie", _cookie);
                     // Also add to custom client if it exists
                     if (_customHttpClient != null)

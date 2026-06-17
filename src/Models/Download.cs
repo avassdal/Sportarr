@@ -71,7 +71,7 @@ public class DownloadClient
     public bool RemoveFailedDownloads { get; set; } = true;
 
     // Tags for scoping to specific leagues
-    public List<int> Tags { get; set; } = new();
+    public List<int> Tags { get; set; } = [];
 
     public DateTime Created { get; set; } = DateTime.UtcNow;
     public DateTime? LastModified { get; set; }
@@ -113,7 +113,7 @@ public class DownloadQueueItem
     public double Progress { get; set; } // 0-100
     public TimeSpan? TimeRemaining { get; set; }
     public string? ErrorMessage { get; set; }
-    public List<string> StatusMessages { get; set; } = new(); // Status messages (warnings, errors)
+    public List<string> StatusMessages { get; set; } = []; // Status messages (warnings, errors)
     public DateTime Added { get; set; } = DateTime.UtcNow;
     public DateTime? CompletedAt { get; set; }
     public DateTime? ImportedAt { get; set; }
@@ -201,7 +201,7 @@ public class Indexer
     public bool EnableInteractiveSearch { get; set; } = true;
 
     // Categories
-    public List<string> Categories { get; set; } = new();
+    public List<string> Categories { get; set; } = [];
     public List<string>? AnimeCategories { get; set; }
 
     // Priority and seeding
@@ -276,13 +276,13 @@ public class Indexer
     /// user enabled here, the grab is escalated to a failed download
     /// (blocklist + retry) instead of being silently warned and skipped.
     /// </summary>
-    public List<int> FailDownloads { get; set; } = new();
+    public List<int> FailDownloads { get; set; } = [];
 
     // Download client association
     public int? DownloadClientId { get; set; }
 
     // Tags for filtering
-    public List<int> Tags { get; set; } = new();
+    public List<int> Tags { get; set; } = [];
 
     // Rate limiting settings
     public int? QueryLimit { get; set; } // Max queries per hour (null = unlimited)
@@ -395,12 +395,12 @@ public class ReleaseSearchResult
     /// <summary>
     /// Reasons why this release was rejected (empty if approved)
     /// </summary>
-    public List<string> Rejections { get; set; } = new();
+    public List<string> Rejections { get; set; } = [];
 
     /// <summary>
     /// Custom formats that matched this release
     /// </summary>
-    public List<MatchedFormat> MatchedFormats { get; set; } = new();
+    public List<MatchedFormat> MatchedFormats { get; set; } = [];
 
     /// <summary>
     /// Base quality score before custom formats
