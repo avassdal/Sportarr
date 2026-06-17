@@ -145,7 +145,7 @@ public static class MetadataAgentEndpoints
             if (evt == null)
                 return Results.Ok(new { error = "Episode not found" });
 
-            var cast = await apiClient.GetEventCastAsync(evt.ExternalId);
+            var cast = await apiClient.GetEventCastAsync(evt.ExternalId!);
             return Results.Ok(ToEpisode(evt, cast));
         });
 
@@ -179,7 +179,7 @@ public static class MetadataAgentEndpoints
                 return Results.Ok(new { error = "Episode not found" });
 
             var seasonLabel = events.Select(e => e.Season).FirstOrDefault(s => !string.IsNullOrEmpty(s));
-            var cast = await apiClient.GetEventCastAsync(evt.ExternalId);
+            var cast = await apiClient.GetEventCastAsync(evt.ExternalId!);
 
             return Results.Ok(new
             {

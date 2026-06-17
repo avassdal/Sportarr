@@ -509,7 +509,7 @@ public class SportsFileNameParser
         };
 
         // Clean the filename (remove extension, replace dots/underscores with spaces for processing)
-        var cleanName = CleanFilename(filename);
+        var cleanName = CleanFilename(filename ?? string.Empty);
 
         // Try each sports pattern
         foreach (var pattern in SportsPatterns)

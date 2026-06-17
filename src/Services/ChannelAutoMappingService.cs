@@ -494,7 +494,7 @@ public class ChannelAutoMappingService
 
         // Promote / refresh / drop based on the final scores. Manual
         // mappings are untouched in any branch.
-        var channelQuality = DetectChannelQuality(channel.Name);
+        var channelQuality = DetectChannelQuality(channel.Name ?? string.Empty);
         int newlyCreated = 0;
         var allLeagueIds = scores.Keys.Concat(existingMappings.Select(m => m.LeagueId)).Distinct().ToList();
 

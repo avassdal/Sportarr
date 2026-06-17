@@ -15,12 +15,12 @@ public class LibraryImportService
     private readonly SportarrDbContext _db;
     private readonly ILogger<LibraryImportService> _logger;
     private readonly MediaFileParser _fileParser;
-    private readonly SportsFileNameParser _sportsParser;
-    private readonly FileNamingService _namingService;
-    private readonly EventPartDetector _partDetector;
-    private readonly ConfigService _configService;
-    private readonly SportarrApiClient _sportarrApiClient;
-    private readonly DiskSpaceService _diskSpaceService;
+    private readonly SportsFileNameParser? _sportsParser;
+    private readonly FileNamingService? _namingService;
+    private readonly EventPartDetector? _partDetector;
+    private readonly ConfigService? _configService;
+    private readonly SportarrApiClient? _sportarrApiClient;
+    private readonly DiskSpaceService? _diskSpaceService;
 
     private static readonly string[] VideoExtensions = SupportedExtensions.Video;
 
@@ -28,12 +28,12 @@ public class LibraryImportService
         SportarrDbContext db,
         ILogger<LibraryImportService> logger,
         MediaFileParser fileParser,
-        SportsFileNameParser sportsParser,
-        FileNamingService namingService,
-        EventPartDetector partDetector,
-        ConfigService configService,
-        SportarrApiClient sportarrApiClient,
-        DiskSpaceService diskSpaceService)
+        SportsFileNameParser? sportsParser,
+        FileNamingService? namingService,
+        EventPartDetector? partDetector,
+        ConfigService? configService,
+        SportarrApiClient? sportarrApiClient,
+        DiskSpaceService? diskSpaceService)
     {
         _db = db;
         _logger = logger;
@@ -89,7 +89,7 @@ public class LibraryImportService
                     var filename = Path.GetFileNameWithoutExtension(filePath);
 
                     // Try sports-specific parser first for better accuracy
-                    var sportsResult = _sportsParser.Parse(filename);
+                    var sportsResult = _sportsParser!.Parse(filename);
                     // ParseWithInspectionAsync runs ffprobe when the filename alone doesn't
                     // give us a Resolution+Source pair. Costs ~50-200ms per uninformative
                     // file but produces accurate Quality on first scan.
@@ -266,7 +266,7 @@ public class LibraryImportService
 
         // Get media management settings for file transfer
         var settings = await GetMediaManagementSettingsAsync();
-        var config = await _configService.GetConfigAsync();
+        var config = await _configService!.GetConfigAsync();
 
         foreach (var request in requests)
         {
@@ -338,7 +338,7 @@ public class LibraryImportService
                         else if (string.IsNullOrEmpty(partName) && config.EnableMultiPartEpisodes)
                         {
                             // Auto-detect part from filename
-                            var partInfo = _partDetector.DetectPart(parsedInfo.EventTitle, existingEvent.Sport);
+                            var partInfo = _partDetector!.DetectPart(parsedInfo.EventTitle, existingEvent.Sport);
                             partName = partInfo?.SegmentName;
                             partNumber = partInfo?.PartNumber;
                         }
@@ -491,7 +491,7 @@ public class LibraryImportService
                     else if (string.IsNullOrEmpty(partName) && config.EnableMultiPartEpisodes && !string.IsNullOrEmpty(parsedInfo.EventTitle))
                     {
                         // Auto-detect part from filename
-                        var partInfo = _partDetector.DetectPart(parsedInfo.EventTitle, sport);
+                        var partInfo = _partDetector!.DetectPart(parsedInfo.EventTitle, sport);
                         partName = partInfo?.SegmentName;
                         partNumber = partInfo?.PartNumber;
                     }
@@ -597,7 +597,7 @@ public class LibraryImportService
 
         // Build folder path using granular folder settings (league/season/event folders)
         // Now uses the correct episode number from API
-        var folderPath = _namingService.BuildFolderPath(settings, eventInfo);
+        var folderPath = _namingService!.BuildFolderPath(settings, eventInfo);
         if (!string.IsNullOrWhiteSpace(folderPath))
         {
             destinationPath = Path.Combine(destinationPath, folderPath);
@@ -629,7 +629,7 @@ public class LibraryImportService
             else if (config.EnableMultiPartEpisodes)
             {
                 // Fallback: try auto-detection from original filename if no part info provided
-                var detectedPart = _partDetector.DetectPart(parsed.EventTitle, eventInfo.Sport);
+                var detectedPart = _partDetector!.DetectPart(parsed.EventTitle, eventInfo.Sport);
                 if (detectedPart != null)
                 {
                     partSuffix = $" - {detectedPart.PartSuffix}";
@@ -1073,7 +1073,7 @@ public class LibraryImportService
         var rootFolders = await _db.RootFolders.ToListAsync();
         if (rootFolders.Any())
         {
-            _diskSpaceService.RefreshLiveState(rootFolders);
+            _diskSpaceService!.RefreshLiveState(rootFolders);
             settings.RootFolders = rootFolders;
         }
 
@@ -1357,7 +1357,7 @@ public class LibraryImportService
 
         // Use FileNamingService to build folder path - this handles all token replacements
         // ({League}, {Season}, {Year}, {Month}, {Day}, {Episode}, {Event Title}, etc.)
-        var folderPath = _namingService.BuildFolderPath(settings, matchedEvent);
+        var folderPath = _namingService!.BuildFolderPath(settings, matchedEvent);
 
         // Build filename using the same logic as actual import
         string filename;
@@ -1471,7 +1471,7 @@ public class LibraryImportService
 
         try
         {
-            var apiEpisodeMap = await _sportarrApiClient.GetEpisodeNumbersFromApiAsync(league.ExternalId, season);
+            var apiEpisodeMap = await _sportarrApiClient!.GetEpisodeNumbersFromApiAsync(league.ExternalId, season);
             if (apiEpisodeMap != null && !string.IsNullOrEmpty(eventInfo.ExternalId) &&
                 apiEpisodeMap.TryGetValue(eventInfo.ExternalId, out var apiEpisodeNumber))
             {
