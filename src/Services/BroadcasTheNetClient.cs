@@ -143,16 +143,16 @@ public class BroadcastheNetTorrent
 /// Implements JSON-RPC API for searching torrent releases.
 /// Rate limit: 5 seconds between requests, 150 requests/hour max.
 /// </summary>
-public class BroadcasTheNetClient
+public class BroadcasTheNetClient : IDisposable
 {
     private readonly HttpClient _httpClient;
     private readonly ILogger<BroadcasTheNetClient> _logger;
     private readonly QualityDetectionService? _qualityDetection;
 
-    // Rate limiting: 5 seconds between requests
-    private static readonly TimeSpan RateLimitDelay = TimeSpan.FromSeconds(5);
-    private static DateTime _lastRequestTime = DateTime.MinValue;
-    private static readonly object _rateLimitLock = new();
+    // Rate limiting: 5 seconds between requests (per-instance, not global)
+    private readonly TimeSpan RateLimitDelay = TimeSpan.FromSeconds(5);
+    private DateTime _lastRequestTime = DateTime.MinValue;
+    private readonly SemaphoreSlim _rateLimitSemaphore = new(1, 1);
 
     public BroadcasTheNetClient(HttpClient httpClient, ILogger<BroadcasTheNetClient> logger, QualityDetectionService? qualityDetection = null)
     {
@@ -417,22 +417,26 @@ public class BroadcasTheNetClient
     }
 
     /// <summary>
-    /// Apply rate limiting delay
+    /// Apply rate limiting delay using async-compatible SemaphoreSlim
     /// </summary>
     private async Task ApplyRateLimitAsync()
     {
-        lock (_rateLimitLock)
+        await _rateLimitSemaphore.WaitAsync();
+        try
         {
             var timeSinceLastRequest = DateTime.UtcNow - _lastRequestTime;
             if (timeSinceLastRequest < RateLimitDelay)
             {
                 var delay = RateLimitDelay - timeSinceLastRequest;
                 _logger.LogDebug("[BTN] Rate limiting: waiting {DelayMs}ms", delay.TotalMilliseconds);
-                Thread.Sleep(delay);
+                await Task.Delay(delay);
             }
             _lastRequestTime = DateTime.UtcNow;
         }
-        await Task.CompletedTask;
+        finally
+        {
+            _rateLimitSemaphore.Release();
+        }
     }
 
     /// <summary>
@@ -482,5 +486,13 @@ public class BroadcasTheNetClient
         }
 
         return score;
+    }
+
+    /// <summary>
+    /// Dispose resources (SemaphoreSlim)
+    /// </summary>
+    public void Dispose()
+    {
+        _rateLimitSemaphore?.Dispose();
     }
 }

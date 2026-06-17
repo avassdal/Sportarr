@@ -495,7 +495,7 @@ public class IndexerSearchService : IIndexerSearchService
             }
 
             // Filter by minimum seeders (for torrents)
-            if (indexer.Type == IndexerType.Torznab && indexer.MinimumSeeders > 0)
+            if ((indexer.Type == IndexerType.Torznab || indexer.Type == IndexerType.BroadcasTheNet) && indexer.MinimumSeeders > 0)
             {
                 results = results.Where(r => r.Seeders >= indexer.MinimumSeeders).ToList();
             }
@@ -744,7 +744,7 @@ public class IndexerSearchService : IIndexerSearchService
     {
         var httpClient = _httpClientFactory.CreateClient("IndexerClient");
         var btnLogger = _loggerFactory.CreateLogger<BroadcasTheNetClient>();
-        var client = new BroadcasTheNetClient(httpClient, btnLogger, _qualityDetection);
+        using var client = new BroadcasTheNetClient(httpClient, btnLogger, _qualityDetection);
 
         return await client.FetchRecentAsync(indexer, maxResults);
     }
@@ -753,7 +753,7 @@ public class IndexerSearchService : IIndexerSearchService
     {
         var httpClient = _httpClientFactory.CreateClient("IndexerClient");
         var btnLogger = _loggerFactory.CreateLogger<BroadcasTheNetClient>();
-        var client = new BroadcasTheNetClient(httpClient, btnLogger, _qualityDetection);
+        using var client = new BroadcasTheNetClient(httpClient, btnLogger, _qualityDetection);
 
         return await client.TestConnectionAsync(indexer);
     }
@@ -797,7 +797,7 @@ public class IndexerSearchService : IIndexerSearchService
     {
         var httpClient = _httpClientFactory.CreateClient("IndexerClient");
         var btnLogger = _loggerFactory.CreateLogger<BroadcasTheNetClient>();
-        var client = new BroadcasTheNetClient(httpClient, btnLogger, _qualityDetection);
+        using var client = new BroadcasTheNetClient(httpClient, btnLogger, _qualityDetection);
 
         return await client.SearchAsync(indexer, query, maxResults);
     }
