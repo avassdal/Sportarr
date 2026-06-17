@@ -433,6 +433,24 @@ public class BroadcasTheNetClient : IDisposable
 
         var responseJson = await response.Content.ReadAsStringAsync();
 
+        // BTN sometimes returns plain-text errors with HTTP 200 (e.g. "Error: Invalid API Key")
+        var trimmed = responseJson.TrimStart();
+        if (!trimmed.StartsWith('{') && !trimmed.StartsWith('['))
+        {
+            var plainText = responseJson.Trim();
+            if (plainText.Contains("Invalid API Key", StringComparison.OrdinalIgnoreCase) ||
+                plainText.Contains("API Key", StringComparison.OrdinalIgnoreCase))
+            {
+                throw new IndexerRequestException($"BTN API key invalid for {config.Name}", HttpStatusCode.Unauthorized);
+            }
+            if (plainText.Contains("Call Limit Exceeded", StringComparison.OrdinalIgnoreCase))
+            {
+                throw new IndexerRateLimitException($"BTN rate limit exceeded for {config.Name} (150 requests/hour)", TimeSpan.FromMinutes(15));
+            }
+            _logger.LogWarning("[BTN] Non-JSON response from {Indexer}: {Body}", config.Name, plainText);
+            throw new IndexerRequestException($"BTN returned unexpected response for {config.Name}: {plainText}", HttpStatusCode.InternalServerError);
+        }
+
         // Check for query execution error
         if (responseJson.Contains("Query execution was interrupted", StringComparison.OrdinalIgnoreCase))
         {
