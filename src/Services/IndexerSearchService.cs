@@ -591,6 +591,10 @@ public class IndexerSearchService : IIndexerSearchService
                 _ => false
             };
         }
+        catch (IndexerRequestException)
+        {
+            throw;
+        }
         catch (Exception ex)
         {
             _logger.LogError(ex, "[Indexer Search] Error testing {Indexer}", indexer.Name);
@@ -708,7 +712,7 @@ public class IndexerSearchService : IIndexerSearchService
             }
 
             // Filter by minimum seeders (for torrents)
-            if (indexer.Type == IndexerType.Torznab && indexer.MinimumSeeders > 0)
+            if ((indexer.Type == IndexerType.Torznab || indexer.Type == IndexerType.BroadcasTheNet) && indexer.MinimumSeeders > 0)
             {
                 results = results.Where(r => r.Seeders >= indexer.MinimumSeeders).ToList();
             }

@@ -144,7 +144,7 @@ public class BroadcastheNetTorrent
 /// Implements JSON-RPC API for searching torrent releases.
 /// Rate limit: 5 seconds between requests, 150 requests/hour max.
 /// </summary>
-public class BroadcasTheNetClient : IDisposable
+public partial class BroadcasTheNetClient : IDisposable
 {
     private readonly HttpClient _httpClient;
     private readonly ILogger<BroadcasTheNetClient> _logger;
@@ -214,8 +214,7 @@ public class BroadcasTheNetClient : IDisposable
         {
             var searchQuery = new BroadcastheNetTorrentQuery
             {
-                Name = pattern,
-                Age = "<=604800"  // Last 7 days for sports events
+                Name = pattern
             };
 
             var request = BuildJsonRpcRequest(config, "getTorrents", searchQuery, maxResults / searchPatterns.Count + 10, 0);
@@ -567,9 +566,12 @@ public class BroadcasTheNetClient : IDisposable
     /// <summary>
     /// Extract release group from title
     /// </summary>
+    [GeneratedRegex(@"-([A-Za-z0-9]+)(?:\.[a-z]{2,4})?$")]
+    private static partial Regex ReleaseGroupRegex();
+
     private static string? ExtractReleaseGroup(string title)
     {
-        var match = System.Text.RegularExpressions.Regex.Match(title, @"-([A-Za-z0-9]+)(?:\.[a-z]{2,4})?$");
+        var match = ReleaseGroupRegex().Match(title);
         if (!match.Success) return null;
         var group = match.Groups[1].Value;
         var excluded = new[] { "DL", "WEB", "HD", "SD", "UHD" };
