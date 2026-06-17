@@ -1167,8 +1167,8 @@ public class AutomaticSearchService : IAutomaticSearchService
 
             if (activeDownloads >= config.MaxDownloadQueueSize)
             {
-                _logger.LogInformation("[Automatic Search] Queue threshold reached ({Active}/{Max}). Skipping batch search cycle. Will retry in {Sleep} seconds.",
-                    activeDownloads, config.MaxDownloadQueueSize, config.SearchSleepDuration);
+                _logger.LogInformation("[Automatic Search] Queue threshold reached ({Active}/{Max}). Skipping batch search cycle. Will retry in {Sleep} minutes.",
+                    activeDownloads, config.MaxDownloadQueueSize, config.BacklogSearchIntervalMinutes);
                 return new List<AutomaticSearchResult>
                 {
                     new() { Success = false, Message = $"Queue threshold reached ({activeDownloads}/{config.MaxDownloadQueueSize})" }
