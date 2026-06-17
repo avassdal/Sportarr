@@ -223,7 +223,7 @@ export default function IndexersSettings() {
   const [saving, setSaving] = useState(false);
   const [hasUnsavedChanges, setHasUnsavedChanges] = useState(false);
   const initialSettings = useRef<{retention: number; rssSyncInterval: number; preferIndexerFlags: boolean; searchCacheDuration: number; minimumAge: number} | null>(null);
-  const { blockNavigation } = useUnsavedChanges(hasUnsavedChanges);
+  useUnsavedChanges(hasUnsavedChanges);
 
   // Download clients drive the per-indexer override dropdown below.
   // Previously this field was a bare number input -- there is no UI
@@ -242,7 +242,7 @@ export default function IndexersSettings() {
   const loadDownloadClients = async () => {
     try {
       const response = await apiClient.get('/downloadclient');
-      const clients = (response.data || []).map((c: any) => ({
+      const clients = (response.data || []).map((c: { id: number; name: string; enabled?: boolean }) => ({
         id: c.id,
         name: c.name,
         enabled: c.enabled !== false,
@@ -362,7 +362,7 @@ export default function IndexersSettings() {
     });
   };
 
-  const handleFormChange = (field: keyof Indexer, value: any) => {
+  const handleFormChange = (field: keyof Indexer, value: Indexer[keyof Indexer]) => {
     setFormData(prev => ({ ...prev, [field]: value }));
   };
 
@@ -386,6 +386,7 @@ export default function IndexersSettings() {
     if (!sameAsText) {
       setCategoriesText(current.join(', '));
     }
+  // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [formData.categories]);
 
   // Caps-driven category options. Sonarr renders the indexer's
@@ -461,6 +462,7 @@ export default function IndexersSettings() {
       cancelled = true;
       clearTimeout(handle);
     };
+  // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [showAddModal, supportsCaps, capsKey]);
 
   // Helper function to convert component format to API format
@@ -624,23 +626,15 @@ export default function IndexersSettings() {
     }
   };
 
-  const [testResult, setTestResult] = useState<{ success: boolean; message: string } | null>(null);
-  const [isTesting, setIsTesting] = useState(false);
-
   const handleTestIndexer = async (indexer: Indexer | Partial<Indexer>) => {
     try {
-      setIsTesting(true);
-      setTestResult(null);
 
       // Convert to API format for testing
       const apiIndexer = toApiFormat(indexer);
 
       const response = await apiClient.post('/indexer/test', apiIndexer);
       const successMessage = response.data?.message || 'Connection successful!';
-      setTestResult({
-        success: true,
-        message: successMessage,
-      });
+
 
       // For plain-RSS indexers the backend's response message contains
       // the auto-detected parser variant (e.g. "Detected ezRSS" or
@@ -652,16 +646,13 @@ export default function IndexersSettings() {
           ? successMessage
           : `Successfully connected to ${indexer.name || 'indexer'}`,
       });
-    } catch (error: any) {
+    } catch (error: unknown) {
       console.error('Test failed:', error);
-      const errorMessage = error.response?.data?.message || error.message || 'Connection test failed!';
-      setTestResult({ success: false, message: errorMessage });
+      const errorMessage = error instanceof Error ? (error as Error & { response?: { data?: { message?: string } } }).response?.data?.message ?? error.message : 'Connection test failed!';
 
       toast.error('Test Failed', {
         description: errorMessage,
       });
-    } finally {
-      setIsTesting(false);
     }
   };
 
