@@ -2,6 +2,7 @@ using System.Net;
 using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
+using System.Text.RegularExpressions;
 using Sportarr.Api.Models;
 
 namespace Sportarr.Api.Services;
@@ -189,44 +190,138 @@ public class BroadcasTheNetClient : IDisposable
     }
 
     /// <summary>
-    /// Search for releases matching query using wildcard name search
+    /// Search for releases matching query using wildcard name search.
+    /// Generates multiple search patterns to improve hit rate for sports content.
     /// </summary>
     public async Task<List<ReleaseSearchResult>> SearchAsync(Indexer config, string query, int maxResults = 100)
     {
         // Apply rate limiting
         await ApplyRateLimitAsync();
 
-        // Build search query with wildcards for name-based search
-        // BTN uses % as wildcard character
-        var searchQuery = new BroadcastheNetTorrentQuery
-        {
-            Name = $"%{query.Replace(" ", ".")}%",  // Convert spaces to dots and wrap with wildcards
-            Age = "<=604800"  // Last 7 days for sports events
-        };
+        // Generate search variations with improved wildcard patterns
+        var searchPatterns = GenerateBtnSearchPatterns(query);
+        var allResults = new List<ReleaseSearchResult>();
+        var seenGuids = new HashSet<string>();
 
-        var request = BuildJsonRpcRequest(config, "getTorrents", searchQuery, maxResults, 0);
+        _logger.LogInformation("[BTN] Searching {Indexer} for: {Query} ({PatternCount} patterns)", config.Name, query, searchPatterns.Count);
 
-        _logger.LogInformation("[BTN] Searching {Indexer} for: {Query}", config.Name, query);
-        _logger.LogDebug("[BTN] Search query: {SearchQuery}", JsonSerializer.Serialize(searchQuery));
+        foreach (var pattern in searchPatterns)
+        {
+            var searchQuery = new BroadcastheNetTorrentQuery
+            {
+                Name = pattern,
+                Age = "<=604800"  // Last 7 days for sports events
+            };
 
-        try
-        {
-            var response = await SendRequestAsync<JsonRpcResponse<BroadcastheNetTorrents>>(config, request);
-            return ParseSearchResults(response, config);
+            var request = BuildJsonRpcRequest(config, "getTorrents", searchQuery, maxResults / searchPatterns.Count + 10, 0);
+
+            _logger.LogDebug("[BTN] Search pattern: {Pattern}", pattern);
+
+            try
+            {
+                var response = await SendRequestAsync<JsonRpcResponse<BroadcastheNetTorrents>>(config, request);
+                var results = ParseSearchResults(response, config);
+
+                // Deduplicate by GUID
+                foreach (var result in results)
+                {
+                    if (seenGuids.Add(result.Guid))
+                    {
+                        allResults.Add(result);
+                    }
+                }
+
+                // If we got good results, we can stop early
+                if (allResults.Count >= maxResults)
+                {
+                    break;
+                }
+            }
+            catch (IndexerRateLimitException)
+            {
+                throw;
+            }
+            catch (IndexerRequestException)
+            {
+                throw;
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "[BTN] Search pattern failed for {Indexer}: {Pattern}", config.Name, pattern);
+                // Continue with next pattern
+            }
         }
-        catch (IndexerRateLimitException)
+
+        _logger.LogInformation("[BTN] Found {Count} unique results from {Indexer}", allResults.Count, config.Name);
+        return allResults.Take(maxResults).ToList();
+    }
+
+    /// <summary>
+    /// Generate multiple search patterns for BTN wildcard search.
+    /// Creates variations with different separators and formats to improve hit rate.
+    /// </summary>
+    private static List<string> GenerateBtnSearchPatterns(string query)
+    {
+        var patterns = new List<string>();
+        if (string.IsNullOrWhiteSpace(query))
         {
-            throw;
+            patterns.Add("%");
+            return patterns;
         }
-        catch (IndexerRequestException)
+
+        // Normalize the query first
+        var normalized = SearchNormalizationService.NormalizeForSearch(query);
+
+        // Remove any existing wildcards to avoid "%%"
+        normalized = normalized.Replace("%", "").Replace("_", "");
+
+        // Pattern 1: Dot-separated (most common in scene releases)
+        // "Formula 1 2026" -> "%Formula.1.2026%"
+        var dotSeparated = Regex.Replace(normalized, @"[\s\-_]+", ".");
+        patterns.Add($"%{dotSeparated}%");
+
+        // Pattern 2: Single wildcard between words (more flexible)
+        // "Formula 1 2026" -> "%Formula%1%2026%"
+        var words = normalized.Split(new[] { ' ' }, StringSplitOptions.RemoveEmptyEntries);
+        if (words.Length > 1)
         {
-            throw;
+            var flexiblePattern = "%" + string.Join("%", words) + "%";
+            patterns.Add(flexiblePattern);
         }
-        catch (Exception ex)
+
+        // Pattern 3: First two words only (for broader matches)
+        // Useful when event has many words but releases use shortened names
+        if (words.Length >= 2)
         {
-            _logger.LogError(ex, "[BTN] Search failed for {Indexer}", config.Name);
-            throw new IndexerRequestException($"Search failed for {config.Name}: {ex.Message}", HttpStatusCode.InternalServerError);
+            var shortPattern = $"%{words[0]}.{words[1]}%";
+            if (!patterns.Contains(shortPattern))
+            {
+                patterns.Add(shortPattern);
+            }
         }
+
+        // Pattern 4: For UFC/events with numbers, try specific patterns
+        // "UFC 300" -> "%UFC.300%" and "%UFC%300%"
+        var ufcMatch = Regex.Match(normalized, @"^(UFC)\s*(\d+)");
+        if (ufcMatch.Success)
+        {
+            var ufcNumber = ufcMatch.Groups[2].Value;
+            patterns.Add($"%UFC.{ufcNumber}%");
+            patterns.Add($"%UFC%{ufcNumber}%");
+        }
+
+        // Pattern 5: For F1/Formula 1 with year and round
+        // "Formula 1 2026 Round 2" -> "%2026x02%" (common scene format)
+        var f1Match = Regex.Match(normalized, @"20(\d{2})\s+(?:Round\s+|R)?(\d{1,2})");
+        if (f1Match.Success)
+        {
+            var year = f1Match.Groups[1].Value;
+            var round = f1Match.Groups[2].Value.PadLeft(2, '0');
+            patterns.Add($"%20{year}x{round}%");
+        }
+
+        // Remove duplicates while preserving order
+        return patterns.Distinct().ToList();
     }
 
     /// <summary>
