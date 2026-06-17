@@ -277,7 +277,7 @@ public static class MetadataAgentEndpoints
         id = e.ExternalId,
         title = e.Title,
         summary = e.Description,
-        thumb_url = e.Images != null ? e.Images.FirstOrDefault() : null,
+        thumb_url = e.Images?.FirstOrDefault(),
         air_date = e.EventDate.ToString("yyyy-MM-dd"),
         broadcast_date = e.BroadcastDate?.ToString("yyyy-MM-dd"),
         season_number = e.SeasonNumber,
@@ -291,7 +291,7 @@ public static class MetadataAgentEndpoints
         away_team = e.AwayTeamName,
         sport = e.Sport,
         cast = cast == null
-            ? Array.Empty<object>()
+            ? (object[])[]
             : cast.Select(c => new
             {
                 name = c.Name,

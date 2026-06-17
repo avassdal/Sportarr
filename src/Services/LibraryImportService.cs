@@ -1,4 +1,5 @@
 using System.Runtime.InteropServices;
+using System.Text.RegularExpressions;
 using Sportarr.Api.Data;
 using Sportarr.Api.Helpers;
 using Sportarr.Api.Models;
@@ -10,7 +11,7 @@ namespace Sportarr.Api.Services;
 /// Handles scanning filesystem and importing existing event files into library
 /// Performs actual file move/copy/hardlink operations with proper renaming
 /// </summary>
-public class LibraryImportService
+public partial class LibraryImportService
 {
     private readonly SportarrDbContext _db;
     private readonly ILogger<LibraryImportService> _logger;
@@ -111,14 +112,14 @@ public class LibraryImportService
                     // Check for explicit SxxxxExx episode number in filename (e.g. "Formula E - S2025E05 - Jeddah E Prix").
                     // This is the highest-confidence signal — explicit S/E parsing wins over fuzzier matchers.
                     int? explicitEpisodeNumber = null;
-                    var seMatch = System.Text.RegularExpressions.Regex.Match(filename, @"S\d{4}E(\d+)", System.Text.RegularExpressions.RegexOptions.IgnoreCase);
+                    var seMatch = SeasonEpisodeRegex().Match(filename);
                     if (seMatch.Success && int.TryParse(seMatch.Groups[1].Value, out var seEp))
                         explicitEpisodeNumber = seEp;
 
                     // Detect multi-part files (e.g. "UFC - S2025E04 - pt3 - UFC 312...")
                     // Part files must be allowed to match the same event as the main file even if
                     // that event was already claimed by an earlier file in this batch.
-                    var isPartFile = System.Text.RegularExpressions.Regex.IsMatch(filename, @"\bpt\d+\b", System.Text.RegularExpressions.RegexOptions.IgnoreCase);
+                    var isPartFile = PartFileRegex().IsMatch(filename);
 
                     // Check if file is already in library
                     // First check Event.FilePath (main file path)
@@ -415,7 +416,7 @@ public class LibraryImportService
                                     Source = request.Source ?? parsedInfo.Source,
                                     ReleaseGroup = request.ReleaseGroup ?? parsedInfo.ReleaseGroup,
                                     OriginalTitle = request.OriginalTitle,
-                                    Languages = request.Languages ?? new List<string>(),
+                                    Languages = request.Languages ?? [],
                                     IndexerFlags = request.IndexerFlags,
                                     PartName = partName,
                                     PartNumber = partNumber,
@@ -523,7 +524,7 @@ public class LibraryImportService
                         Source = request.Source ?? parsedInfo.Source,
                         ReleaseGroup = request.ReleaseGroup ?? parsedInfo.ReleaseGroup,
                         OriginalTitle = request.OriginalTitle,
-                        Languages = request.Languages ?? new List<string>(),
+                        Languages = request.Languages ?? [],
                         IndexerFlags = request.IndexerFlags,
                         PartName = partName,
                         PartNumber = partNumber,
@@ -1050,7 +1051,7 @@ public class LibraryImportService
             // Create default settings with granular folder options
             settings = new MediaManagementSettings
             {
-                RootFolders = new List<RootFolder>(),
+                RootFolders = [],
                 RenameFiles = true,
                 StandardFileFormat = "{Series} - {Season}{Episode}{Part} - {Event Title} - {Quality Full}",
                 // Granular folder settings - default: league/season folders enabled, event folders disabled
@@ -1417,17 +1418,17 @@ public class LibraryImportService
             return parsedDate.Value.Year;
 
         // 3. Check file path for "Season YYYY" pattern (most reliable for organized libraries)
-        var seasonMatch = System.Text.RegularExpressions.Regex.Match(filePath, @"[Ss]eason[\s\._-]*(\d{4})");
+        var seasonMatch = SeasonYearRegex().Match(filePath);
         if (seasonMatch.Success && int.TryParse(seasonMatch.Groups[1].Value, out var seasonYear))
             return seasonYear;
 
         // 4. Check filename for SYYYYEXX pattern (e.g., S2016E08)
-        var seasonEpisodeMatch = System.Text.RegularExpressions.Regex.Match(filename, @"S(\d{4})E\d+", System.Text.RegularExpressions.RegexOptions.IgnoreCase);
+        var seasonEpisodeMatch = SeasonEpisodeYearRegex().Match(filename);
         if (seasonEpisodeMatch.Success && int.TryParse(seasonEpisodeMatch.Groups[1].Value, out var seYear))
             return seYear;
 
         // 5. Check for standalone year in filename or path (less reliable but still useful)
-        var yearMatch = System.Text.RegularExpressions.Regex.Match(filePath, @"\b(19[5-9]\d|20[0-2]\d)\b");
+        var yearMatch = StandaloneYearRegex().Match(filePath);
         if (yearMatch.Success && int.TryParse(yearMatch.Value, out var year))
         {
             // Sanity check - year should be reasonable (not too far in past/future)
@@ -1534,6 +1535,21 @@ public class LibraryImportService
 
         return updatedCount;
     }
+
+    [GeneratedRegex(@"S\d{4}E(\d+)", RegexOptions.IgnoreCase)]
+    private static partial Regex SeasonEpisodeRegex();
+
+    [GeneratedRegex(@"\bpt\d+\b", RegexOptions.IgnoreCase)]
+    private static partial Regex PartFileRegex();
+
+    [GeneratedRegex(@"[Ss]eason[\s\._-]*(\d{4})")]
+    private static partial Regex SeasonYearRegex();
+
+    [GeneratedRegex(@"S(\d{4})E\d+", RegexOptions.IgnoreCase)]
+    private static partial Regex SeasonEpisodeYearRegex();
+
+    [GeneratedRegex(@"\b(19[5-9]\d|20[0-2]\d)\b")]
+    private static partial Regex StandaloneYearRegex();
 }
 
 /// <summary>
@@ -1544,10 +1560,10 @@ public class LibraryScanResult
     public required string FolderPath { get; set; }
     public DateTime ScannedAt { get; set; }
     public int TotalFiles { get; set; }
-    public List<ImportableFile> MatchedFiles { get; set; } = new();
-    public List<ImportableFile> UnmatchedFiles { get; set; } = new();
-    public List<ImportableFile> AlreadyInLibrary { get; set; } = new();
-    public List<string> Errors { get; set; } = new();
+    public List<ImportableFile> MatchedFiles { get; set; } = [];
+    public List<ImportableFile> UnmatchedFiles { get; set; } = [];
+    public List<ImportableFile> AlreadyInLibrary { get; set; } = [];
+    public List<string> Errors { get; set; } = [];
 }
 
 /// <summary>
@@ -1578,7 +1594,7 @@ public class ImportableFile
     /// the user can re-search the indexer with this exact title later.</summary>
     public string? OriginalTitle { get; set; }
     /// <summary>Languages detected by ffprobe from audio stream language tags.</summary>
-    public List<string> Languages { get; set; } = new();
+    public List<string> Languages { get; set; } = [];
     public int? MatchedEventId { get; set; }
     public string? MatchedEventTitle { get; set; }
     public string? MatchedLeagueName { get; set; }
@@ -1594,13 +1610,13 @@ public class ImportableFile
 
     private static string FormatBytes(long bytes)
     {
-        string[] sizes = { "B", "KB", "MB", "GB", "TB" };
+        string[] sizes = ["B", "KB", "MB", "GB", "TB"];
         double len = bytes;
         int order = 0;
         while (len >= 1024 && order < sizes.Length - 1)
         {
             order++;
-            len = len / 1024;
+            len /= 1024;
         }
         return $"{len:0.##} {sizes[order]}";
     }
@@ -1683,9 +1699,9 @@ public enum LibraryImportMode
 /// </summary>
 public class ImportResult
 {
-    public List<string> Imported { get; set; } = new();
-    public List<string> Created { get; set; } = new();
-    public List<string> Skipped { get; set; } = new();
-    public List<string> Failed { get; set; } = new();
-    public List<string> Errors { get; set; } = new();
+    public List<string> Imported { get; set; } = [];
+    public List<string> Created { get; set; } = [];
+    public List<string> Skipped { get; set; } = [];
+    public List<string> Failed { get; set; } = [];
+    public List<string> Errors { get; set; } = [];
 }

@@ -44,12 +44,12 @@ public class SportDetectionTests
             _dbContext,
             _mockLibraryLogger.Object,
             _fileParser,
-            null,
-            null,
-            null,
-            null,
-            null,
-            null);
+            default,
+            default,
+            default,
+            default,
+            default,
+            default);
     }
 
     #region Fighting Sport Tests
