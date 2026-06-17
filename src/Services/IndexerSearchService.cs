@@ -453,6 +453,7 @@ public class IndexerSearchService : IIndexerSearchService
                 {
                     IndexerType.Torznab => await SearchTorznabAsync(indexer, query, maxResults),
                     IndexerType.Newznab => await SearchNewznabAsync(indexer, query, maxResults),
+                    IndexerType.BroadcasTheNet => await SearchBroadcasTheNetAsync(indexer, query, maxResults),
                     // Plain-RSS indexers don't support search — the feed
                     // has no ?q= parameter, so RSS is poll-only. Mirrors
                     // the upstream "Torrent RSS Feed" indexer's
@@ -481,6 +482,7 @@ public class IndexerSearchService : IIndexerSearchService
             var protocol = indexer.Type switch
             {
                 IndexerType.Torznab => "Torrent",
+                IndexerType.BroadcasTheNet => "Torrent",
                 IndexerType.Torrent => "Torrent",
                 IndexerType.Rss => "Torrent", // RSS feeds are typically torrents
                 IndexerType.Newznab => "Usenet",
@@ -585,6 +587,7 @@ public class IndexerSearchService : IIndexerSearchService
                 IndexerType.Torznab => await TestTorznabAsync(indexer),
                 IndexerType.Newznab => await TestNewznabAsync(indexer),
                 IndexerType.Rss => await TestRssAsync(indexer),
+                IndexerType.BroadcasTheNet => await TestBroadcasTheNetAsync(indexer),
                 _ => false
             };
         }
@@ -670,6 +673,7 @@ public class IndexerSearchService : IIndexerSearchService
                     IndexerType.Torznab => await FetchTorznabRssAsync(indexer, maxResults),
                     IndexerType.Newznab => await FetchNewznabRssAsync(indexer, maxResults),
                     IndexerType.Rss => await FetchPlainRssAsync(indexer, maxResults),
+                    IndexerType.BroadcasTheNet => await FetchBroadcasTheNetRecentAsync(indexer, maxResults),
                     _ => new List<ReleaseSearchResult>()
                 };
 
@@ -736,6 +740,24 @@ public class IndexerSearchService : IIndexerSearchService
         return await client.FetchRssFeedAsync(indexer, maxResults);
     }
 
+    private async Task<List<ReleaseSearchResult>> FetchBroadcasTheNetRecentAsync(Indexer indexer, int maxResults)
+    {
+        var httpClient = _httpClientFactory.CreateClient("IndexerClient");
+        var btnLogger = _loggerFactory.CreateLogger<BroadcasTheNetClient>();
+        var client = new BroadcasTheNetClient(httpClient, btnLogger, _qualityDetection);
+
+        return await client.FetchRecentAsync(indexer, maxResults);
+    }
+
+    private async Task<bool> TestBroadcasTheNetAsync(Indexer indexer)
+    {
+        var httpClient = _httpClientFactory.CreateClient("IndexerClient");
+        var btnLogger = _loggerFactory.CreateLogger<BroadcasTheNetClient>();
+        var client = new BroadcasTheNetClient(httpClient, btnLogger, _qualityDetection);
+
+        return await client.TestConnectionAsync(indexer);
+    }
+
     private async Task<List<ReleaseSearchResult>> FetchNewznabRssAsync(Indexer indexer, int maxResults)
     {
         // Log categories being used for RSS (important for filtering out non-TV content)
@@ -767,6 +789,15 @@ public class IndexerSearchService : IIndexerSearchService
         var httpClient = _httpClientFactory.CreateClient("IndexerClient");
         var newznabLogger = _loggerFactory.CreateLogger<NewznabClient>();
         var client = new NewznabClient(httpClient, newznabLogger, _qualityDetection);
+
+        return await client.SearchAsync(indexer, query, maxResults);
+    }
+
+    private async Task<List<ReleaseSearchResult>> SearchBroadcasTheNetAsync(Indexer indexer, string query, int maxResults)
+    {
+        var httpClient = _httpClientFactory.CreateClient("IndexerClient");
+        var btnLogger = _loggerFactory.CreateLogger<BroadcasTheNetClient>();
+        var client = new BroadcasTheNetClient(httpClient, btnLogger, _qualityDetection);
 
         return await client.SearchAsync(indexer, query, maxResults);
     }
