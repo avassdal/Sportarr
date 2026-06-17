@@ -182,10 +182,15 @@ public class BroadcasTheNetClient : IDisposable
             _logger.LogInformation("[BTN] Connection successful to {Indexer}", config.Name);
             return true;
         }
+        catch (IndexerRequestException ex) when (ex.StatusCode == HttpStatusCode.Unauthorized)
+        {
+            _logger.LogError(ex, "[BTN] Connection test failed for {Indexer}: Invalid API key", config.Name);
+            throw;
+        }
         catch (Exception ex)
         {
             _logger.LogError(ex, "[BTN] Connection test failed for {Indexer}", config.Name);
-            return false;
+            throw;
         }
     }
 
@@ -429,6 +434,13 @@ public class BroadcasTheNetClient : IDisposable
             var errorBody = await response.Content.ReadAsStringAsync();
             _logger.LogWarning("[BTN] HTTP error {Status} for {Indexer}: {Body}", response.StatusCode, config.Name, errorBody);
             throw new IndexerRequestException($"BTN request failed: {response.StatusCode}", response.StatusCode);
+        }
+
+        // Sonarr pattern: HTML response means site is blocked/behind captcha
+        var contentType = response.Content.Headers.ContentType?.MediaType ?? "";
+        if (contentType.Contains("text/html", StringComparison.OrdinalIgnoreCase))
+        {
+            throw new IndexerRequestException($"BTN returned HTML for {config.Name} - site may be blocked or behind a captcha", HttpStatusCode.ServiceUnavailable);
         }
 
         var responseJson = await response.Content.ReadAsStringAsync();
