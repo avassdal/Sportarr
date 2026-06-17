@@ -330,7 +330,9 @@ public static class DatabaseInitializer
                 if (exists == 0)
                 {
                     Console.WriteLine($"[Sportarr] ChannelLeagueMappings.{col} column missing - adding it now...");
+#pragma warning disable EF0100
                     db.Database.ExecuteSqlRaw($"ALTER TABLE ChannelLeagueMappings ADD COLUMN {col} {type}");
+#pragma warning restore EF0100
                 }
             }
             db.Database.ExecuteSqlRaw(
