@@ -115,7 +115,7 @@ const indexerTemplates: IndexerTemplate[] = [
     implementation: 'BroadcasTheNet',
     protocol: 'torrent',
     description: 'BroadcasTheNet (BTN) - Private TV tracker with sports content support via JSON-RPC API.',
-    fields: ['baseUrl', 'apiKey', 'minimumSeeders', 'seedRatio', 'seedTime']
+    fields: ['apiKey', 'minimumSeeders', 'seedRatio', 'seedTime']
   }
 ];
 
@@ -352,7 +352,7 @@ export default function IndexersSettings() {
       protocol: template.protocol,
       enabled: true,
       priority: 25,
-      baseUrl: '',
+      baseUrl: template.implementation === 'BroadcasTheNet' ? 'https://api.broadcasthe.net' : '',
       apiPath: template.implementation === 'BroadcasTheNet' ? '' : '/api',
       apiKey: '',
       categories: [],
@@ -466,7 +466,7 @@ export default function IndexersSettings() {
   // Helper function to convert component format to API format
   const toApiFormat = (indexer: Partial<Indexer>): Partial<ApiIndexer> => {
     const fields: { name: string; value: string | string[] }[] = [
-      { name: 'baseUrl', value: indexer.baseUrl || '' },
+      { name: 'baseUrl', value: indexer.implementation === 'BroadcasTheNet' ? 'https://api.broadcasthe.net' : (indexer.baseUrl || '') },
       { name: 'apiPath', value: indexer.implementation === 'BroadcasTheNet' ? '' : (indexer.apiPath || '/api') },
       { name: 'apiKey', value: indexer.apiKey || '' },
       { name: 'categories', value: indexer.categories?.join(',') || '' },
@@ -760,10 +760,11 @@ export default function IndexersSettings() {
         </div>
 
         {/* Connection */}
-        {hasField('baseUrl') && (
+        {(hasField('baseUrl') || formData.implementation === 'BroadcasTheNet') && (
           <div className="space-y-4">
             <h4 className="text-lg font-semibold text-white">Connection</h4>
 
+            {formData.implementation !== 'BroadcasTheNet' ? (
             <div>
               <label className="block text-sm font-medium text-gray-300 mb-2">URL *</label>
               <input
@@ -777,6 +778,13 @@ export default function IndexersSettings() {
                 {isUsenet ? 'Newznab feed URL' : 'Torznab feed URL (from Jackett/Prowlarr)'}
               </p>
             </div>
+            ) : (
+            <div>
+              <label className="block text-sm font-medium text-gray-300 mb-2">URL</label>
+              <p className="px-4 py-2 bg-gray-900 border border-gray-700 rounded-lg text-gray-400 text-sm">https://api.broadcasthe.net</p>
+              <p className="text-xs text-gray-500 mt-1">BTN API endpoint is fixed and cannot be changed.</p>
+            </div>
+            )}
 
             {formData.implementation !== 'BroadcasTheNet' && (
             <div>
