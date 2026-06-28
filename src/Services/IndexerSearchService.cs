@@ -177,7 +177,7 @@ public class IndexerSearchService : IIndexerSearchService
         {
             var include = indexer.Type switch
             {
-                IndexerType.Torznab or IndexerType.Torrent => hasTorrentClient,
+                IndexerType.Torznab or IndexerType.Torrent or IndexerType.BroadcasTheNet => hasTorrentClient,
                 IndexerType.Newznab => hasUsenetClient,
                 _ => false
             };
