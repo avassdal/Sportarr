@@ -11,6 +11,12 @@
     <SkipFrontendBuild Condition="'$(SkipFrontendBuild)' == ''">false</SkipFrontendBuild>
   </PropertyGroup>
 
+  <ItemGroup>
+    <AssemblyAttribute Include="System.Runtime.CompilerServices.InternalsVisibleTo">
+      <_Parameter1>Sportarr.Api.Tests</_Parameter1>
+    </AssemblyAttribute>
+  </ItemGroup>
+
   <!-- Automatic Frontend Build - runs before .NET build -->
   <!-- Builds React frontend and copies to wwwroot for serving -->
   <!-- Skip with: dotnet build -p:SkipFrontendBuild=true -->

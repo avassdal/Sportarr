@@ -684,7 +684,7 @@ app.MapPost("/api/indexer/test", async (
         {
             "newznab" => IndexerType.Newznab,
             "rss" or "torrentrss" or "torrent rss feed" => IndexerType.Rss,
-            "broadcasthenet" or "btn" => IndexerType.BroadcasTheNet,
+            "broadcasthenet" or "btn" => IndexerType.BroadcasTheNet, // "btn" kept for legacy/import compat
             _ => IndexerType.Torznab,
         };
     }

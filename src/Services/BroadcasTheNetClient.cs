@@ -1,3 +1,4 @@
+using System.Collections.Concurrent;
 using System.Net;
 using System.Text;
 using System.Text.Json;
@@ -150,10 +151,12 @@ public partial class BroadcasTheNetClient : IDisposable
     private readonly ILogger<BroadcasTheNetClient> _logger;
     private readonly QualityDetectionService? _qualityDetection;
 
-    // Rate limiting: 5 seconds between requests (per-instance, not global)
-    private readonly TimeSpan RateLimitDelay = TimeSpan.FromSeconds(5);
-    private DateTime _lastRequestTime = DateTime.MinValue;
-    private readonly SemaphoreSlim _rateLimitSemaphore = new(1, 1);
+    // Rate limiting: 5 seconds between requests per indexer, shared across all instances.
+    // Keyed by indexer ID so per-indexer budgets are tracked independently.
+    // Entries are intentionally never removed — indexer count is small and bounded.
+    private static readonly TimeSpan RateLimitDelay = TimeSpan.FromSeconds(5);
+    private static readonly ConcurrentDictionary<int, DateTime> _lastRequestTimes = new();
+    private static readonly ConcurrentDictionary<int, SemaphoreSlim> _indexerSemaphores = new();
 
     public BroadcasTheNetClient(HttpClient httpClient, ILogger<BroadcasTheNetClient> logger, QualityDetectionService? qualityDetection = null)
     {
@@ -201,7 +204,7 @@ public partial class BroadcasTheNetClient : IDisposable
     public async Task<List<ReleaseSearchResult>> SearchAsync(Indexer config, string query, int maxResults = 100)
     {
         // Apply rate limiting
-        await ApplyRateLimitAsync();
+        await ApplyRateLimitAsync(config.Id);
 
         // Generate search variations with improved wildcard patterns
         var searchPatterns = GenerateBtnSearchPatterns(query);
@@ -245,14 +248,15 @@ public partial class BroadcasTheNetClient : IDisposable
             {
                 throw;
             }
-            catch (IndexerRequestException)
+            catch (IndexerRequestException ex) when (ex.StatusCode == HttpStatusCode.Unauthorized)
             {
+                // Auth failure is terminal — no point trying remaining patterns.
                 throw;
             }
             catch (Exception ex)
             {
+                // Per-pattern API errors (e.g. overly-broad query) are non-terminal: log and try next pattern.
                 _logger.LogWarning(ex, "[BTN] Search pattern failed for {Indexer}: {Pattern}", config.Name, pattern);
-                // Continue with next pattern
             }
         }
 
@@ -304,13 +308,12 @@ public partial class BroadcasTheNetClient : IDisposable
             }
         }
 
-        // Pattern 4: For UFC/events with numbers, try specific patterns
-        // "UFC 300" -> "%UFC.300%" and "%UFC%300%"
-        var ufcMatch = Regex.Match(normalized, @"^(UFC)\s*(\d+)");
+        // Pattern 4: For UFC events, add flexible wildcard variant (dot-sep already covered by Pattern 1)
+        // "UFC 300" -> "%UFC%300%"
+        var ufcMatch = Regex.Match(normalized, @"^UFC\s*(\d+)");
         if (ufcMatch.Success)
         {
-            var ufcNumber = ufcMatch.Groups[2].Value;
-            patterns.Add($"%UFC.{ufcNumber}%");
+            var ufcNumber = ufcMatch.Groups[1].Value;
             patterns.Add($"%UFC%{ufcNumber}%");
         }
 
@@ -334,7 +337,7 @@ public partial class BroadcasTheNetClient : IDisposable
     public async Task<List<ReleaseSearchResult>> FetchRecentAsync(Indexer config, int maxResults = 100)
     {
         // Apply rate limiting
-        await ApplyRateLimitAsync();
+        await ApplyRateLimitAsync(config.Id);
 
         // Query for recent releases (last 24 hours)
         var query = new BroadcastheNetTorrentQuery
@@ -462,12 +465,6 @@ public partial class BroadcasTheNetClient : IDisposable
             throw new IndexerRequestException($"BTN returned unexpected response for {config.Name}: {plainText}", HttpStatusCode.InternalServerError);
         }
 
-        // Check for query execution error
-        if (responseJson.Contains("Query execution was interrupted", StringComparison.OrdinalIgnoreCase))
-        {
-            throw new IndexerRequestException($"BTN server error for {config.Name}: Query execution was interrupted", HttpStatusCode.InternalServerError);
-        }
-
         var result = JsonSerializer.Deserialize<T>(responseJson);
         if (result == null)
         {
@@ -487,7 +484,9 @@ public partial class BroadcasTheNetClient : IDisposable
         if (response.Error != null)
         {
             _logger.LogWarning("[BTN] API error for {Indexer}: {Error}", config.Name, response.Error.Message);
-            return results;
+            throw new IndexerRequestException(
+                $"BTN API error for {config.Name}: {response.Error.Message}",
+                HttpStatusCode.InternalServerError);
         }
 
         if (response.Result == null || response.Result.Torrents == null || response.Result.Torrents.Count == 0)
@@ -541,25 +540,27 @@ public partial class BroadcasTheNetClient : IDisposable
     }
 
     /// <summary>
-    /// Apply rate limiting delay using async-compatible SemaphoreSlim
+    /// Apply rate limiting delay per indexer ID. Static state survives across per-call instances.
     /// </summary>
-    private async Task ApplyRateLimitAsync()
+    private async Task ApplyRateLimitAsync(int indexerId)
     {
-        await _rateLimitSemaphore.WaitAsync();
+        var semaphore = _indexerSemaphores.GetOrAdd(indexerId, _ => new SemaphoreSlim(1, 1));
+        await semaphore.WaitAsync();
         try
         {
-            var timeSinceLastRequest = DateTime.UtcNow - _lastRequestTime;
+            var lastRequest = _lastRequestTimes.GetOrAdd(indexerId, DateTime.MinValue);
+            var timeSinceLastRequest = DateTime.UtcNow - lastRequest;
             if (timeSinceLastRequest < RateLimitDelay)
             {
                 var delay = RateLimitDelay - timeSinceLastRequest;
                 _logger.LogDebug("[BTN] Rate limiting: waiting {DelayMs}ms", delay.TotalMilliseconds);
                 await Task.Delay(delay);
             }
-            _lastRequestTime = DateTime.UtcNow;
+            _lastRequestTimes[indexerId] = DateTime.UtcNow;
         }
         finally
         {
-            _rateLimitSemaphore.Release();
+            semaphore.Release();
         }
     }
 
@@ -615,11 +616,5 @@ public partial class BroadcasTheNetClient : IDisposable
         return score;
     }
 
-    /// <summary>
-    /// Dispose resources (SemaphoreSlim)
-    /// </summary>
-    public void Dispose()
-    {
-        _rateLimitSemaphore?.Dispose();
-    }
+    public void Dispose() { }
 }

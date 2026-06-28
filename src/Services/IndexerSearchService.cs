@@ -744,21 +744,22 @@ public class IndexerSearchService : IIndexerSearchService
         return await client.FetchRssFeedAsync(indexer, maxResults);
     }
 
-    private async Task<List<ReleaseSearchResult>> FetchBroadcasTheNetRecentAsync(Indexer indexer, int maxResults)
+    private BroadcasTheNetClient CreateBtnClient()
     {
         var httpClient = _httpClientFactory.CreateClient("IndexerClient");
         var btnLogger = _loggerFactory.CreateLogger<BroadcasTheNetClient>();
-        using var client = new BroadcasTheNetClient(httpClient, btnLogger, _qualityDetection);
+        return new BroadcasTheNetClient(httpClient, btnLogger, _qualityDetection);
+    }
 
+    private async Task<List<ReleaseSearchResult>> FetchBroadcasTheNetRecentAsync(Indexer indexer, int maxResults)
+    {
+        using var client = CreateBtnClient();
         return await client.FetchRecentAsync(indexer, maxResults);
     }
 
     private async Task<bool> TestBroadcasTheNetAsync(Indexer indexer)
     {
-        var httpClient = _httpClientFactory.CreateClient("IndexerClient");
-        var btnLogger = _loggerFactory.CreateLogger<BroadcasTheNetClient>();
-        using var client = new BroadcasTheNetClient(httpClient, btnLogger, _qualityDetection);
-
+        using var client = CreateBtnClient();
         return await client.TestConnectionAsync(indexer);
     }
 
@@ -799,10 +800,7 @@ public class IndexerSearchService : IIndexerSearchService
 
     private async Task<List<ReleaseSearchResult>> SearchBroadcasTheNetAsync(Indexer indexer, string query, int maxResults)
     {
-        var httpClient = _httpClientFactory.CreateClient("IndexerClient");
-        var btnLogger = _loggerFactory.CreateLogger<BroadcasTheNetClient>();
-        using var client = new BroadcasTheNetClient(httpClient, btnLogger, _qualityDetection);
-
+        using var client = CreateBtnClient();
         return await client.SearchAsync(indexer, query, maxResults);
     }
 

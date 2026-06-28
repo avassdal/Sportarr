@@ -1,56 +1,16 @@
 using Sportarr.Api.Services;
-using Sportarr.Api.Data;
-using Sportarr.Api.Models;
 using FluentAssertions;
-using Microsoft.Extensions.Logging;
-using Microsoft.EntityFrameworkCore;
-using Microsoft.Extensions.DependencyInjection;
-using Microsoft.Extensions.Http;
-using Moq;
 
 namespace Sportarr.Api.Tests.Services;
 
 /// <summary>
-/// Tests for sport detection system in ImportListService and LibraryImportService
-/// Verifies that the DeriveEventSport() method correctly identifies sports from keywords
+/// Tests for sport detection system in LibraryImportService.
+/// DeriveEventSport is an internal static method — no service instance needed.
 /// </summary>
 public class SportDetectionTests
 {
-    private readonly Mock<ILogger<ImportListService>> _mockImportLogger;
-    private readonly Mock<ILogger<LibraryImportService>> _mockLibraryLogger;
-    private readonly Mock<ILogger<MediaFileParser>> _mockParserLogger;
-    private readonly Mock<IServiceScopeFactory> _mockScopeFactory;
-    private readonly Mock<IHttpClientFactory> _mockHttpClientFactory;
-    private readonly SportarrDbContext _dbContext;
-    private readonly MediaFileParser _fileParser;
-    private readonly LibraryImportService service;
-
-    public SportDetectionTests()
-    {
-        _mockImportLogger = new Mock<ILogger<ImportListService>>();
-        _mockLibraryLogger = new Mock<ILogger<LibraryImportService>>();
-        _mockParserLogger = new Mock<ILogger<MediaFileParser>>();
-        _mockScopeFactory = new Mock<IServiceScopeFactory>();
-        _mockHttpClientFactory = new Mock<IHttpClientFactory>();
-        _fileParser = new MediaFileParser(_mockParserLogger.Object);
-
-        // Create in-memory database for testing
-        var options = new DbContextOptionsBuilder<SportarrDbContext>()
-            .UseInMemoryDatabase(databaseName: Guid.NewGuid().ToString())
-            .Options;
-        _dbContext = new SportarrDbContext(options);
-
-        service = new LibraryImportService(
-            _dbContext,
-            _mockLibraryLogger.Object,
-            _fileParser,
-            default,
-            default,
-            default,
-            default,
-            default,
-            default);
-    }
+    private static string Detect(string organization, string title) =>
+        LibraryImportService.DeriveEventSport(organization, title);
 
     #region Fighting Sport Tests
 
@@ -78,14 +38,7 @@ public class SportDetectionTests
     public void DeriveEventSport_Fighting_Keywords_Should_Return_Fighting(
         string organization, string title, string expectedSport)
     {
-        // Act - Use reflection to call private method
-        var method = typeof(LibraryImportService).GetMethod(
-            "DeriveEventSport",
-            System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance);
-        var result = method?.Invoke(service, new object[] { organization, title }) as string;
-
-        // Assert
-        result.Should().Be(expectedSport);
+        Detect(organization, title).Should().Be(expectedSport);
     }
 
     #endregion
@@ -111,14 +64,7 @@ public class SportDetectionTests
     public void DeriveEventSport_Soccer_Keywords_Should_Return_Soccer(
         string organization, string title, string expectedSport)
     {
-        // Act
-        var method = typeof(LibraryImportService).GetMethod(
-            "DeriveEventSport",
-            System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance);
-        var result = method?.Invoke(service, new object[] { organization, title }) as string;
-
-        // Assert
-        result.Should().Be(expectedSport);
+        Detect(organization, title).Should().Be(expectedSport);
     }
 
     #endregion
@@ -138,14 +84,7 @@ public class SportDetectionTests
     public void DeriveEventSport_Basketball_Keywords_Should_Return_Basketball(
         string organization, string title, string expectedSport)
     {
-        // Act
-        var method = typeof(LibraryImportService).GetMethod(
-            "DeriveEventSport",
-            System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance);
-        var result = method?.Invoke(service, new object[] { organization, title }) as string;
-
-        // Assert
-        result.Should().Be(expectedSport);
+        Detect(organization, title).Should().Be(expectedSport);
     }
 
     #endregion
@@ -164,14 +103,7 @@ public class SportDetectionTests
     public void DeriveEventSport_AmericanFootball_Keywords_Should_Return_AmericanFootball(
         string organization, string title, string expectedSport)
     {
-        // Act
-        var method = typeof(LibraryImportService).GetMethod(
-            "DeriveEventSport",
-            System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance);
-        var result = method?.Invoke(service, new object[] { organization, title }) as string;
-
-        // Assert
-        result.Should().Be(expectedSport);
+        Detect(organization, title).Should().Be(expectedSport);
     }
 
     #endregion
@@ -188,14 +120,7 @@ public class SportDetectionTests
     public void DeriveEventSport_Baseball_Keywords_Should_Return_Baseball(
         string organization, string title, string expectedSport)
     {
-        // Act
-        var method = typeof(LibraryImportService).GetMethod(
-            "DeriveEventSport",
-            System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance);
-        var result = method?.Invoke(service, new object[] { organization, title }) as string;
-
-        // Assert
-        result.Should().Be(expectedSport);
+        Detect(organization, title).Should().Be(expectedSport);
     }
 
     #endregion
@@ -213,14 +138,7 @@ public class SportDetectionTests
     public void DeriveEventSport_IceHockey_Keywords_Should_Return_IceHockey(
         string organization, string title, string expectedSport)
     {
-        // Act
-        var method = typeof(LibraryImportService).GetMethod(
-            "DeriveEventSport",
-            System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance);
-        var result = method?.Invoke(service, new object[] { organization, title }) as string;
-
-        // Assert
-        result.Should().Be(expectedSport);
+        Detect(organization, title).Should().Be(expectedSport);
     }
 
     #endregion
@@ -239,14 +157,7 @@ public class SportDetectionTests
     public void DeriveEventSport_Tennis_Keywords_Should_Return_Tennis(
         string organization, string title, string expectedSport)
     {
-        // Act
-        var method = typeof(LibraryImportService).GetMethod(
-            "DeriveEventSport",
-            System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance);
-        var result = method?.Invoke(service, new object[] { organization, title }) as string;
-
-        // Assert
-        result.Should().Be(expectedSport);
+        Detect(organization, title).Should().Be(expectedSport);
     }
 
     #endregion
@@ -262,14 +173,7 @@ public class SportDetectionTests
     public void DeriveEventSport_Golf_Keywords_Should_Return_Golf(
         string organization, string title, string expectedSport)
     {
-        // Act
-        var method = typeof(LibraryImportService).GetMethod(
-            "DeriveEventSport",
-            System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance);
-        var result = method?.Invoke(service, new object[] { organization, title }) as string;
-
-        // Assert
-        result.Should().Be(expectedSport);
+        Detect(organization, title).Should().Be(expectedSport);
     }
 
     #endregion
@@ -290,14 +194,7 @@ public class SportDetectionTests
     public void DeriveEventSport_Motorsport_Keywords_Should_Return_Motorsport(
         string organization, string title, string expectedSport)
     {
-        // Act
-        var method = typeof(LibraryImportService).GetMethod(
-            "DeriveEventSport",
-            System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance);
-        var result = method?.Invoke(service, new object[] { organization, title }) as string;
-
-        // Assert
-        result.Should().Be(expectedSport);
+        Detect(organization, title).Should().Be(expectedSport);
     }
 
     #endregion
@@ -313,14 +210,7 @@ public class SportDetectionTests
     public void DeriveEventSport_Rugby_Keywords_Should_Return_Rugby(
         string organization, string title, string expectedSport)
     {
-        // Act
-        var method = typeof(LibraryImportService).GetMethod(
-            "DeriveEventSport",
-            System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance);
-        var result = method?.Invoke(service, new object[] { organization, title }) as string;
-
-        // Assert
-        result.Should().Be(expectedSport);
+        Detect(organization, title).Should().Be(expectedSport);
     }
 
     #endregion
@@ -337,14 +227,7 @@ public class SportDetectionTests
     public void DeriveEventSport_Cricket_Keywords_Should_Return_Cricket(
         string organization, string title, string expectedSport)
     {
-        // Act
-        var method = typeof(LibraryImportService).GetMethod(
-            "DeriveEventSport",
-            System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance);
-        var result = method?.Invoke(service, new object[] { organization, title }) as string;
-
-        // Assert
-        result.Should().Be(expectedSport);
+        Detect(organization, title).Should().Be(expectedSport);
     }
 
     #endregion
@@ -358,14 +241,8 @@ public class SportDetectionTests
     public void DeriveEventSport_Unknown_Keywords_Should_Default_To_Fighting(
         string organization, string title, string expectedSport)
     {
-        // Act
-        var method = typeof(LibraryImportService).GetMethod(
-            "DeriveEventSport",
-            System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance);
-        var result = method?.Invoke(service, new object[] { organization, title }) as string;
-
-        // Assert
-        result.Should().Be(expectedSport, "backward compatibility requires unknown events to default to Fighting");
+        Detect(organization, title).Should().Be(expectedSport,
+            "backward compatibility requires unknown events to default to Fighting");
     }
 
     [Theory]
@@ -375,14 +252,7 @@ public class SportDetectionTests
     public void DeriveEventSport_Should_Check_Both_Organization_And_Title(
         string organization, string title, string expectedSport)
     {
-        // Act
-        var method = typeof(LibraryImportService).GetMethod(
-            "DeriveEventSport",
-            System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance);
-        var result = method?.Invoke(service, new object[] { organization, title }) as string;
-
-        // Assert
-        result.Should().Be(expectedSport);
+        Detect(organization, title).Should().Be(expectedSport);
     }
 
     [Theory]
@@ -392,14 +262,7 @@ public class SportDetectionTests
     public void DeriveEventSport_Should_Be_Case_Insensitive(
         string organization, string title, string expectedSport)
     {
-        // Act
-        var method = typeof(LibraryImportService).GetMethod(
-            "DeriveEventSport",
-            System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance);
-        var result = method?.Invoke(service, new object[] { organization, title }) as string;
-
-        // Assert
-        result.Should().Be(expectedSport, "sport detection should be case-insensitive");
+        Detect(organization, title).Should().Be(expectedSport, "sport detection should be case-insensitive");
     }
 
     #endregion
@@ -409,16 +272,7 @@ public class SportDetectionTests
     [Fact]
     public void DeriveEventSport_Fighting_Keywords_Take_Priority()
     {
-        // Fighting keywords are checked first, so UFC should return Fighting
-        var method = typeof(LibraryImportService).GetMethod(
-            "DeriveEventSport",
-            System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance);
-
-        // Act
-        var result = method?.Invoke(service, new object[] { "UFC", "UFC 300" }) as string;
-
-        // Assert
-        result.Should().Be("Fighting", "Fighting keywords are checked first in priority order");
+        Detect("UFC", "UFC 300").Should().Be("Fighting", "Fighting keywords are checked first in priority order");
     }
 
     #endregion

@@ -648,7 +648,8 @@ export default function IndexersSettings() {
       });
     } catch (error: unknown) {
       console.error('Test failed:', error);
-      const errorMessage = error instanceof Error ? (error as Error & { response?: { data?: { message?: string } } }).response?.data?.message ?? error.message : 'Connection test failed!';
+      const err = error as { response?: { data?: { message?: string } }; message?: string };
+      const errorMessage = err?.response?.data?.message ?? err?.message ?? 'Connection test failed!';
 
       toast.error('Test Failed', {
         description: errorMessage,
