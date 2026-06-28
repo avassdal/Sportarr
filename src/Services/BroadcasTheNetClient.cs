@@ -217,7 +217,8 @@ public partial class BroadcasTheNetClient : IDisposable
         {
             var searchQuery = new BroadcastheNetTorrentQuery
             {
-                Name = pattern
+                Name = pattern,
+                Category = "Episode"
             };
 
             var request = BuildJsonRpcRequest(config, "getTorrents", searchQuery, maxResults / searchPatterns.Count + 10, 0);
@@ -471,6 +472,12 @@ public partial class BroadcasTheNetClient : IDisposable
             {
                 throw new IndexerRateLimitException($"BTN rate limit exceeded for {config.Name} (150 requests/hour)", TimeSpan.FromMinutes(15));
             }
+            if (plainText.Equals("Query execution was interrupted", StringComparison.OrdinalIgnoreCase))
+            {
+                throw new IndexerRequestException(
+                    $"BTN query interrupted for {config.Name} - query may be too broad",
+                    HttpStatusCode.InternalServerError);
+            }
             _logger.LogWarning("[BTN] Non-JSON response from {Indexer}: {Body}", config.Name, plainText);
             throw new IndexerRequestException($"BTN returned unexpected response for {config.Name}: {plainText}", HttpStatusCode.InternalServerError);
         }
@@ -507,9 +514,11 @@ public partial class BroadcasTheNetClient : IDisposable
 
         foreach (var torrent in response.Result.Torrents.Values)
         {
+            var releaseName = torrent.ReleaseName?.Replace("\\", "") ?? "";
+
             var result = new ReleaseSearchResult
             {
-                Title = torrent.ReleaseName,
+                Title = releaseName,
                 Guid = $"BTN-{torrent.TorrentId}",
                 DownloadUrl = torrent.DownloadUrl,
                 InfoUrl = $"https://broadcasthe.net/torrents.php?id={torrent.GroupId}&torrentid={torrent.TorrentId}",
@@ -519,14 +528,14 @@ public partial class BroadcasTheNetClient : IDisposable
                 Size = torrent.Size,
                 Seeders = torrent.Seeders,
                 Leechers = torrent.Leechers,
-                Language = LanguageDetector.DetectLanguage(torrent.ReleaseName),
-                ReleaseGroup = ExtractReleaseGroup(torrent.ReleaseName)
+                Language = LanguageDetector.DetectLanguage(releaseName),
+                ReleaseGroup = ExtractReleaseGroup(releaseName)
             };
 
             // Parse quality using enhanced detection service if available
             if (_qualityDetection != null)
             {
-                var qualityInfo = _qualityDetection.ParseQuality(torrent.ReleaseName);
+                var qualityInfo = _qualityDetection.ParseQuality(releaseName);
                 result.Quality = qualityInfo.Resolution ?? torrent.Resolution;
                 result.Source = qualityInfo.Source ?? torrent.Source;
                 result.Codec = qualityInfo.Codec ?? torrent.Codec;
