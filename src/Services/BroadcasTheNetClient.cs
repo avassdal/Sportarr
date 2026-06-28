@@ -422,6 +422,16 @@ public partial class BroadcasTheNetClient : IDisposable
             throw new IndexerRequestException($"BTN API endpoint not found for {config.Name} - API may have changed", HttpStatusCode.NotFound);
         }
 
+        // Redirect means Cloudflare or the site is intercepting (AllowAutoRedirect is disabled for BTN).
+        if ((int)response.StatusCode is >= 300 and < 400)
+        {
+            var location = response.Headers.Location?.ToString() ?? "(no Location header)";
+            _logger.LogWarning("[BTN] Redirected for {Indexer}: {Status} → {Location}", config.Name, response.StatusCode, location);
+            throw new IndexerRequestException(
+                $"BTN API redirected ({response.StatusCode}) for {config.Name} - possible Cloudflare block. Location: {location}",
+                HttpStatusCode.ServiceUnavailable);
+        }
+
         if (response.StatusCode == HttpStatusCode.ServiceUnavailable)
         {
             var responseBody = await response.Content.ReadAsStringAsync();

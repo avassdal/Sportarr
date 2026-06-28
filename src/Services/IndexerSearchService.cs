@@ -746,7 +746,7 @@ public class IndexerSearchService : IIndexerSearchService
 
     private BroadcasTheNetClient CreateBtnClient()
     {
-        var httpClient = _httpClientFactory.CreateClient("IndexerClient");
+        var httpClient = _httpClientFactory.CreateClient("BtnClient");
         var btnLogger = _loggerFactory.CreateLogger<BroadcasTheNetClient>();
         return new BroadcasTheNetClient(httpClient, btnLogger, _qualityDetection);
     }
