@@ -467,7 +467,11 @@ public partial class BroadcasTheNetClient
         await _rateLimitService.WaitAndPulseAsync(host, config.Id.ToString(), RateLimit);
 
         var json = JsonSerializer.Serialize(request);
-        var content = new StringContent(json, Encoding.UTF8, "application/json");
+        _logger.LogDebug("[BTN] Request to {Host}: {Json}", host,
+            string.IsNullOrEmpty(config.ApiKey) ? json : json.Replace(config.ApiKey, "[REDACTED]"));
+        // Sonarr sends Content-Type: application/json-rpc; BTN's PHP backend uses this to
+        // identify JSON-RPC requests. Sending application/json causes it to throw ERROR 500.
+        var content = new StringContent(json, Encoding.UTF8, "application/json-rpc");
 
         var requestMessage = new HttpRequestMessage(HttpMethod.Post, $"{baseUrl}/")
         {
