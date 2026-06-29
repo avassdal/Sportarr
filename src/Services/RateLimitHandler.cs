@@ -46,6 +46,10 @@ public class RateLimitHandler : DelegatingHandler
             }
         }
 
+        // Strip internal routing headers before the request leaves the process
+        request.Headers.Remove("X-Indexer-Id");
+        request.Headers.Remove("X-Rate-Limit-Ms");
+
         // Wait for rate limit before sending request
         await _rateLimitService.WaitAndPulseAsync(host, indexerId, rateLimit);
 

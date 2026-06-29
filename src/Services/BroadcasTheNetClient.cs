@@ -166,14 +166,14 @@ public partial class BroadcasTheNetClient : IDisposable
     }
 
     /// <summary>
-    /// Test connection to BTN indexer by calling getTorrents with empty query
+    /// Test connection to BTN indexer
     /// </summary>
     public async Task<bool> TestConnectionAsync(Indexer config)
     {
         try
         {
             var query = new BroadcastheNetTorrentQuery { Age = "<=86400" };
-            var request = BuildJsonRpcRequest(config, "getTorrents", query, 1, 0);
+            var request = BuildJsonRpcRequest(config, "getTorrents", query, 1);
             var response = await SendRequestAsync<JsonRpcResponse<BroadcastheNetTorrents>>(config, request);
 
             if (response.Error != null)
@@ -221,7 +221,7 @@ public partial class BroadcasTheNetClient : IDisposable
                 Category = "Episode"
             };
 
-            var request = BuildJsonRpcRequest(config, "getTorrents", searchQuery, maxResults / searchPatterns.Count + 10, 0);
+            var request = BuildJsonRpcRequest(config, "getTorrents", searchQuery, maxResults / searchPatterns.Count + 10);
 
             _logger.LogDebug("[BTN] Search pattern: {Pattern}", pattern);
 
@@ -346,7 +346,7 @@ public partial class BroadcasTheNetClient : IDisposable
             Age = "<=86400"  // Last 24 hours
         };
 
-        var request = BuildJsonRpcRequest(config, "getTorrents", query, maxResults, 0);
+        var request = BuildJsonRpcRequest(config, "getTorrents", query, maxResults);
 
         _logger.LogDebug("[BTN] Fetching recent releases from {Indexer}", config.Name);
 
@@ -373,7 +373,7 @@ public partial class BroadcasTheNetClient : IDisposable
     /// <summary>
     /// Build JSON-RPC request
     /// </summary>
-    private JsonRpcRequest BuildJsonRpcRequest(Indexer config, string method, BroadcastheNetTorrentQuery query, int limit, int offset)
+    private JsonRpcRequest BuildJsonRpcRequest(Indexer config, string method, BroadcastheNetTorrentQuery query, int limit, int offset = 0)
     {
         return new JsonRpcRequest
         {
@@ -383,7 +383,7 @@ public partial class BroadcasTheNetClient : IDisposable
                 config.ApiKey ?? "",  // API key as first parameter
                 query,                // Search query object
                 limit,                // Page size
-                offset                // Offset for pagination
+                offset                // Page offset
             }
         };
     }
@@ -407,8 +407,7 @@ public partial class BroadcasTheNetClient : IDisposable
             Content = content
         };
 
-        // Add indexer ID header for rate limit tracking
-        requestMessage.Headers.Add("X-Indexer-Id", config.Id.ToString());
+        requestMessage.Headers.Accept.ParseAdd("application/json");
 
         using var response = await _httpClient.SendAsync(requestMessage);
 
@@ -453,6 +452,9 @@ public partial class BroadcasTheNetClient : IDisposable
         var contentType = response.Content.Headers.ContentType?.MediaType ?? "";
         if (contentType.Contains("text/html", StringComparison.OrdinalIgnoreCase))
         {
+            var htmlSnippet = await response.Content.ReadAsStringAsync();
+            _logger.LogWarning("[BTN] HTML response from {Indexer} (HTTP {Status}): {Snippet}",
+                config.Name, (int)response.StatusCode, htmlSnippet.Length > 500 ? htmlSnippet[..500] : htmlSnippet);
             throw new IndexerRequestException($"BTN returned HTML for {config.Name} - site may be blocked or behind a captcha", HttpStatusCode.ServiceUnavailable);
         }
 

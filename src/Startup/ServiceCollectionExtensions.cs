@@ -117,7 +117,7 @@ public static class ServiceCollectionExtensions
             .ConfigureHttpClient(client =>
             {
                 client.Timeout = TimeSpan.FromSeconds(30);
-                client.DefaultRequestHeaders.UserAgent.ParseAdd("Sonarr/3.0");
+                client.DefaultRequestHeaders.UserAgent.ParseAdd("Sonarr/4.0.14.3025");
             });
 
         // IPTV stream proxying (avoids CORS issues in browser)

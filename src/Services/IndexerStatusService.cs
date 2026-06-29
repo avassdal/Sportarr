@@ -28,11 +28,11 @@ public class IndexerStatusService
     private static readonly TimeSpan StartupGracePeriod = TimeSpan.FromMinutes(15);
     private static readonly TimeSpan MaxBackoffDuringStartup = TimeSpan.FromMinutes(5);
 
-    // Escalation backoff configuration: 0, 1, 5, 15, 30, 60 minutes, then 1 day.
+    // Escalation backoff configuration: 1, 5, 15, 30, 60 minutes, then 1 day.
     // Each consecutive failure bumps the level; success resets to 0.
     private static readonly TimeSpan[] BackoffDurations = new[]
     {
-        TimeSpan.Zero,              // Level 0: Immediate retry (first failure)
+        TimeSpan.FromMinutes(1),    // Level 0: 1 minute (first failure)
         TimeSpan.FromMinutes(1),    // Level 1: 1 minute
         TimeSpan.FromMinutes(5),    // Level 2: 5 minutes
         TimeSpan.FromMinutes(15),   // Level 3: 15 minutes
