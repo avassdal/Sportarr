@@ -63,23 +63,23 @@ public class JsonRpcError
 /// </summary>
 public class BroadcastheNetTorrentQuery
 {
-    [JsonPropertyName("tvdb")]
+    [JsonPropertyName("Tvdb")]
     [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
-    public int? Tvdb { get; set; }
+    public string? Tvdb { get; set; }
 
-    [JsonPropertyName("tvrage")]
+    [JsonPropertyName("Tvrage")]
     [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
-    public int? Tvrage { get; set; }
+    public string? Tvrage { get; set; }
 
-    [JsonPropertyName("name")]
+    [JsonPropertyName("Name")]
     [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
     public string? Name { get; set; }
 
-    [JsonPropertyName("category")]
+    [JsonPropertyName("Category")]
     [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
     public string? Category { get; set; }
 
-    [JsonPropertyName("age")]
+    [JsonPropertyName("Age")]
     [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
     public string? Age { get; set; }
 }
