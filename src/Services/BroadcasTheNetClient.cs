@@ -137,17 +137,29 @@ public class BroadcastheNetTorrents
 /// </summary>
 public class BroadcastheNetTorrent
 {
-    [JsonPropertyName("TorrentID")]
-    public int TorrentId { get; set; }
+    [JsonPropertyName("GroupName")]
+    public string? GroupName { get; set; }
 
     [JsonPropertyName("GroupID")]
     public int GroupId { get; set; }
+
+    [JsonPropertyName("TorrentID")]
+    public int TorrentId { get; set; }
 
     [JsonPropertyName("SeriesID")]
     public int SeriesId { get; set; }
 
     [JsonPropertyName("Series")]
     public string? Series { get; set; }
+
+    [JsonPropertyName("SeriesBanner")]
+    public string? SeriesBanner { get; set; }
+
+    [JsonPropertyName("SeriesPoster")]
+    public string? SeriesPoster { get; set; }
+
+    [JsonPropertyName("YoutubeTrailer")]
+    public string? YoutubeTrailer { get; set; }
 
     [JsonPropertyName("Category")]
     public string? Category { get; set; }
@@ -196,6 +208,10 @@ public class BroadcastheNetTorrent
 
     [JsonPropertyName("InfoHash")]
     public string? InfoHash { get; set; }
+
+    // v5-develop addition: used for subtitle/freeleech flag detection
+    [JsonPropertyName("Tags")]
+    public List<string>? Tags { get; set; }
 
     [JsonPropertyName("DownloadURL")]
     public string DownloadUrl { get; set; } = "";
