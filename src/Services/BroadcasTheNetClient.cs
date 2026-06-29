@@ -22,8 +22,10 @@ public class JsonRpcRequest
     [JsonPropertyName("params")]
     public List<object> Params { get; set; } = new();
 
+    // Sonarr uses a random 8-char GUID substring (string, not int).
+    // BTN's PHP validates the id type, so match exactly.
     [JsonPropertyName("id")]
-    public int Id { get; set; } = 1;
+    public string Id { get; set; } = Guid.NewGuid().ToString()[..8];
 }
 
 /// <summary>
@@ -41,7 +43,7 @@ public class JsonRpcResponse<T>
     public JsonRpcError? Error { get; set; }
 
     [JsonPropertyName("id")]
-    public int Id { get; set; }
+    public string Id { get; set; } = "";
 }
 
 /// <summary>
@@ -57,12 +59,53 @@ public class JsonRpcError
 }
 
 /// <summary>
-/// BTN torrent query parameters — null properties are omitted from serialization
-/// to match Sonarr's Newtonsoft DefaultValueHandling.Ignore behaviour.
-/// BTN's API returns HTTP 200 / ERROR 500 if unexpected null fields are present.
+/// BTN torrent query parameters.
+/// Null/default properties are omitted (matches Sonarr's Newtonsoft DefaultValueHandling.Ignore).
+/// Field names are PascalCase — BTN's PHP API is case-sensitive.
+/// All fields mirror Sonarr's BroadcastheNetTorrentQuery exactly.
 /// </summary>
 public class BroadcastheNetTorrentQuery
 {
+    [JsonPropertyName("Id")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public string? Id { get; set; }
+
+    [JsonPropertyName("Category")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public string? Category { get; set; }
+
+    [JsonPropertyName("Name")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public string? Name { get; set; }
+
+    [JsonPropertyName("Search")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public string? Search { get; set; }
+
+    [JsonPropertyName("Codec")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public IEnumerable<string>? Codec { get; set; }
+
+    [JsonPropertyName("Container")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public IEnumerable<string>? Container { get; set; }
+
+    [JsonPropertyName("Source")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public IEnumerable<string>? Source { get; set; }
+
+    [JsonPropertyName("Resolution")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public IEnumerable<string>? Resolution { get; set; }
+
+    [JsonPropertyName("Origin")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public IEnumerable<string>? Origin { get; set; }
+
+    [JsonPropertyName("Hash")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public string? Hash { get; set; }
+
     [JsonPropertyName("Tvdb")]
     [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
     public string? Tvdb { get; set; }
@@ -71,68 +114,52 @@ public class BroadcastheNetTorrentQuery
     [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
     public string? Tvrage { get; set; }
 
-    [JsonPropertyName("Name")]
-    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
-    public string? Name { get; set; }
-
-    [JsonPropertyName("Category")]
-    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
-    public string? Category { get; set; }
-
     [JsonPropertyName("Age")]
     [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
     public string? Age { get; set; }
 }
 
 /// <summary>
-/// BTN torrents response container
+/// BTN torrents response container — matches Sonarr's BroadcastheNetTorrents exactly.
 /// </summary>
 public class BroadcastheNetTorrents
 {
-    [JsonPropertyName("results")]
+    [JsonPropertyName("Results")]
     public int Results { get; set; }
 
-    [JsonPropertyName("torrents")]
-    public Dictionary<string, BroadcastheNetTorrent>? Torrents { get; set; }
+    [JsonPropertyName("Torrents")]
+    public Dictionary<int, BroadcastheNetTorrent>? Torrents { get; set; }
 }
 
 /// <summary>
-/// Individual BTN torrent details
+/// Individual BTN torrent details — field types match Sonarr's BroadcastheNetTorrent exactly.
+/// BTN sends TorrentID/GroupID/TvdbID/TvrageID as JSON integers, not strings.
 /// </summary>
 public class BroadcastheNetTorrent
 {
     [JsonPropertyName("TorrentID")]
-    public string TorrentId { get; set; } = "";
+    public int TorrentId { get; set; }
 
     [JsonPropertyName("GroupID")]
-    public string GroupId { get; set; } = "";
+    public int GroupId { get; set; }
 
-    [JsonPropertyName("ReleaseName")]
-    public string ReleaseName { get; set; } = "";
+    [JsonPropertyName("SeriesID")]
+    public int SeriesId { get; set; }
 
-    [JsonPropertyName("DownloadURL")]
-    public string DownloadUrl { get; set; } = "";
+    [JsonPropertyName("Series")]
+    public string? Series { get; set; }
 
-    [JsonPropertyName("InfoHash")]
-    public string? InfoHash { get; set; }
+    [JsonPropertyName("Category")]
+    public string? Category { get; set; }
 
-    [JsonPropertyName("Size")]
-    public long Size { get; set; }
+    [JsonPropertyName("Snatched")]
+    public int? Snatched { get; set; }
 
     [JsonPropertyName("Seeders")]
-    public int Seeders { get; set; }
+    public int? Seeders { get; set; }
 
     [JsonPropertyName("Leechers")]
-    public int Leechers { get; set; }
-
-    [JsonPropertyName("Time")]
-    public long Time { get; set; }
-
-    [JsonPropertyName("TvdbID")]
-    public string? TvdbId { get; set; }
-
-    [JsonPropertyName("Origin")]
-    public string? Origin { get; set; }
+    public int? Leechers { get; set; }
 
     [JsonPropertyName("Source")]
     public string? Source { get; set; }
@@ -145,6 +172,33 @@ public class BroadcastheNetTorrent
 
     [JsonPropertyName("Resolution")]
     public string? Resolution { get; set; }
+
+    [JsonPropertyName("Origin")]
+    public string? Origin { get; set; }
+
+    [JsonPropertyName("ReleaseName")]
+    public string ReleaseName { get; set; } = "";
+
+    [JsonPropertyName("Size")]
+    public long Size { get; set; }
+
+    [JsonPropertyName("Time")]
+    public long Time { get; set; }
+
+    [JsonPropertyName("TvdbID")]
+    public int? TvdbId { get; set; }
+
+    [JsonPropertyName("TvrageID")]
+    public int? TvrageId { get; set; }
+
+    [JsonPropertyName("ImdbID")]
+    public string? ImdbId { get; set; }
+
+    [JsonPropertyName("InfoHash")]
+    public string? InfoHash { get; set; }
+
+    [JsonPropertyName("DownloadURL")]
+    public string DownloadUrl { get; set; } = "";
 }
 
 /// <summary>
@@ -414,7 +468,8 @@ public partial class BroadcasTheNetClient : IDisposable
             Content = content
         };
 
-        requestMessage.Headers.Accept.ParseAdd("application/json");
+        // Sonarr sends both accept types; match exactly so BTN's content negotiation doesn't differ.
+        requestMessage.Headers.Accept.ParseAdd("application/json-rpc, application/json");
 
         using var response = await _httpClient.SendAsync(requestMessage);
 
