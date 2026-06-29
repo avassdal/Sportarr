@@ -297,7 +297,7 @@ public partial class BroadcasTheNetClient
                 Category = "Episode"
             };
 
-            var request = BuildJsonRpcRequest(config, "getTorrents", searchQuery, maxResults / searchPatterns.Count + 10);
+            var request = BuildJsonRpcRequest(config, "getTorrents", searchQuery, Math.Min(maxResults / searchPatterns.Count + 10, 100));
 
             _logger.LogDebug("[BTN] Search pattern: {Pattern}", pattern);
 
@@ -421,10 +421,6 @@ public partial class BroadcasTheNetClient
             var response = await SendRequestAsync<JsonRpcResponse<BroadcastheNetTorrents>>(config, request);
             return ParseSearchResults(response, config);
         }
-        catch (IndexerRateLimitException)
-        {
-            throw;
-        }
         catch (IndexerRequestException)
         {
             throw;
@@ -464,8 +460,11 @@ public partial class BroadcasTheNetClient
             baseUrl = "https://api.broadcasthe.net";
 
         // Rate limit every outbound call so multi-pattern searches don't fire back-to-back.
-        // Uses the shared IRateLimitService keyed on the BTN hostname + indexer ID.
-        await _rateLimitService.WaitAndPulseAsync(new Uri(baseUrl).Host, config.Id.ToString(), RateLimit);
+        // Use the hostname as the base key so all BTN indexers share the same
+        // per-host bucket, matching how RateLimitHandler keys Torznab/Newznab.
+        // Fall back to the raw URL if parsing fails (misconfigured Url field).
+        var host = Uri.TryCreate(baseUrl, UriKind.Absolute, out var uri) ? uri.Host : baseUrl;
+        await _rateLimitService.WaitAndPulseAsync(host, config.Id.ToString(), RateLimit);
 
         var json = JsonSerializer.Serialize(request);
         var content = new StringContent(json, Encoding.UTF8, "application/json");
