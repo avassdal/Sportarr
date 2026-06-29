@@ -272,137 +272,84 @@ public partial class BroadcasTheNetClient
     }
 
     /// <summary>
-    /// Search for releases matching query using wildcard name search.
-    /// Generates multiple search patterns to improve hit rate for sports content.
+    /// Search for releases matching query.
+    /// Strategy: BTN's PHP API requires Tvdb or Tvrage when filtering by Name — sports events
+    /// don't have standard series identifiers. We therefore fetch recent BTN releases
+    /// constrained only by Age and filter the results locally against the query terms.
+    /// This guarantees a working API call (same pattern as TestConnectionAsync/FetchRecentAsync)
+    /// and avoids the HTML ERROR 500 that Name-only queries trigger.
     /// </summary>
     public async Task<List<ReleaseSearchResult>> SearchAsync(Indexer config, string query, int maxResults = 100)
     {
-        var searchPatterns = GenerateBtnSearchPatterns(query);
-        if (searchPatterns.Count == 0)
+        if (string.IsNullOrWhiteSpace(query))
         {
             _logger.LogDebug("[BTN] Empty query for {Indexer} — skipping search", config.Name);
             return new List<ReleaseSearchResult>();
         }
 
-        var allResults = new List<ReleaseSearchResult>();
-        var seenGuids = new HashSet<string>();
+        // Derive a reasonable age window from the query: if it contains recent years use a
+        // tighter window so BTN returns more targeted content within the page limit.
+        var ageWindow = ExtractAgeWindowDays(query);
 
-        _logger.LogInformation("[BTN] Searching {Indexer} for: {Query} ({PatternCount} patterns)", config.Name, query, searchPatterns.Count);
+        var searchQuery = new BroadcastheNetTorrentQuery { Age = $"<={ageWindow}" };
+        var request = BuildJsonRpcRequest(config, "getTorrents", searchQuery, 100);
 
-        foreach (var pattern in searchPatterns)
+        _logger.LogInformation("[BTN] Searching {Indexer} for: {Query} (Age<={Age}, local filter)",
+            config.Name, query, ageWindow);
+
+        List<ReleaseSearchResult> fetched;
+        try
         {
-            var searchQuery = new BroadcastheNetTorrentQuery
-            {
-                Name = pattern,
-                Category = "Episode"
-            };
-
-            var request = BuildJsonRpcRequest(config, "getTorrents", searchQuery, Math.Min(maxResults / searchPatterns.Count + 10, 100));
-
-            _logger.LogDebug("[BTN] Search pattern: {Pattern}", pattern);
-
-            try
-            {
-                var response = await SendRequestAsync<JsonRpcResponse<BroadcastheNetTorrents>>(config, request);
-                var results = ParseSearchResults(response, config);
-
-                // Deduplicate by GUID
-                foreach (var result in results)
-                {
-                    if (seenGuids.Add(result.Guid))
-                    {
-                        allResults.Add(result);
-                    }
-                }
-
-                // If we got good results, we can stop early
-                if (allResults.Count >= maxResults)
-                {
-                    break;
-                }
-            }
-            catch (IndexerRateLimitException)
-            {
-                throw;
-            }
-            catch (IndexerRequestException ex) when (ex.StatusCode == HttpStatusCode.Unauthorized)
-            {
-                // Auth failure is terminal — no point trying remaining patterns.
-                throw;
-            }
-            catch (Exception ex)
-            {
-                // Per-pattern API errors (e.g. overly-broad query) are non-terminal: log and try next pattern.
-                _logger.LogWarning(ex, "[BTN] Search pattern failed for {Indexer}: {Pattern}", config.Name, pattern);
-            }
+            var response = await SendRequestAsync<JsonRpcResponse<BroadcastheNetTorrents>>(config, request);
+            fetched = ParseSearchResults(response, config);
+        }
+        catch (IndexerRateLimitException) { throw; }
+        catch (IndexerRequestException ex) when (ex.StatusCode == HttpStatusCode.Unauthorized) { throw; }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "[BTN] Search failed for {Indexer}", config.Name);
+            throw new IndexerRequestException($"BTN search failed for {config.Name}: {ex.Message}",
+                HttpStatusCode.InternalServerError);
         }
 
-        _logger.LogInformation("[BTN] Found {Count} unique results from {Indexer}", allResults.Count, config.Name);
-        return allResults.Take(maxResults).ToList();
+        var matched = FilterByQueryTerms(fetched, query).Take(maxResults).ToList();
+
+        _logger.LogInformation("[BTN] Fetched {Total}, matched {Count} for '{Query}' from {Indexer}",
+            fetched.Count, matched.Count, query, config.Name);
+
+        return matched;
     }
 
     /// <summary>
-    /// Generate multiple search patterns for BTN wildcard search.
-    /// Creates variations with different separators and formats to improve hit rate.
+    /// Determine how many days of history to request from BTN based on the query.
+    /// If the query references the current or previous year, use 365 days.
+    /// For older or unrecognised years, use 730 days (2 years) to catch backfill.
     /// </summary>
-    private static List<string> GenerateBtnSearchPatterns(string query)
+    private static int ExtractAgeWindowDays(string query)
     {
-        var patterns = new List<string>();
-        if (string.IsNullOrWhiteSpace(query))
-            return patterns;
+        var currentYear = DateTimeOffset.UtcNow.Year;
+        if (query.Contains(currentYear.ToString()) || query.Contains((currentYear - 1).ToString()))
+            return 365;
+        return 730;
+    }
 
-        // Normalize the query first
-        var normalized = SearchNormalizationService.NormalizeForSearch(query);
+    /// <summary>
+    /// Keep results whose Title contains every significant term from the query.
+    /// Terms shorter than 2 characters (e.g. "1") are treated as optional so they don't
+    /// over-filter results with varied episode numbering.
+    /// </summary>
+    private static List<ReleaseSearchResult> FilterByQueryTerms(List<ReleaseSearchResult> results, string query)
+    {
+        var terms = Regex.Split(query.Trim(), @"[\s\.\-_]+")
+            .Where(t => t.Length >= 3)
+            .ToList();
 
-        // Remove any existing wildcards to avoid "%%"
-        normalized = normalized.Replace("%", "").Replace("_", "");
+        if (terms.Count == 0)
+            return results;
 
-        // Pattern 1: Dot-separated (most common in scene releases)
-        // "Formula 1 2026" -> "%Formula.1.2026%"
-        var dotSeparated = Regex.Replace(normalized, @"[\s\-_]+", ".");
-        patterns.Add($"%{dotSeparated}%");
-
-        // Pattern 2: Single wildcard between words (more flexible)
-        // "Formula 1 2026" -> "%Formula%1%2026%"
-        var words = normalized.Split(new[] { ' ' }, StringSplitOptions.RemoveEmptyEntries);
-        if (words.Length > 1)
-        {
-            var flexiblePattern = "%" + string.Join("%", words) + "%";
-            patterns.Add(flexiblePattern);
-        }
-
-        // Pattern 3: First two words only (for broader matches)
-        // Useful when event has many words but releases use shortened names
-        if (words.Length >= 2)
-        {
-            var shortPattern = $"%{words[0]}.{words[1]}%";
-            if (!patterns.Contains(shortPattern))
-            {
-                patterns.Add(shortPattern);
-            }
-        }
-
-        // Pattern 4: For UFC events, add flexible wildcard variant (dot-sep already covered by Pattern 1)
-        // "UFC 300" -> "%UFC%300%"
-        var ufcMatch = Regex.Match(normalized, @"^UFC\s*(\d+)");
-        if (ufcMatch.Success)
-        {
-            var ufcNumber = ufcMatch.Groups[1].Value;
-            patterns.Add($"%UFC%{ufcNumber}%");
-        }
-
-        // Pattern 5: For F1/Formula 1 with year and round
-        // "Formula 1 2026 Round 2" -> "%2026x02%" (common scene format)
-        var f1Match = Regex.Match(normalized, @"20(\d{2})\s+(?:Round\s+|R)?(\d{1,2})");
-        if (f1Match.Success)
-        {
-            var year = f1Match.Groups[1].Value;
-            var round = f1Match.Groups[2].Value.PadLeft(2, '0');
-            patterns.Add($"%20{year}x{round}%");
-        }
-
-        // Remove duplicates while preserving order
-        return patterns.Distinct().ToList();
+        return results
+            .Where(r => terms.All(term => r.Title.Contains(term, StringComparison.OrdinalIgnoreCase)))
+            .ToList();
     }
 
     /// <summary>
@@ -420,6 +367,10 @@ public partial class BroadcasTheNetClient
         {
             var response = await SendRequestAsync<JsonRpcResponse<BroadcastheNetTorrents>>(config, request);
             return ParseSearchResults(response, config);
+        }
+        catch (IndexerRateLimitException)
+        {
+            throw;
         }
         catch (IndexerRequestException)
         {
@@ -467,13 +418,13 @@ public partial class BroadcasTheNetClient
         await _rateLimitService.WaitAndPulseAsync(host, config.Id.ToString(), RateLimit);
 
         var json = JsonSerializer.Serialize(request);
-        _logger.LogDebug("[BTN] Request to {Host}: {Json}", host,
-            string.IsNullOrEmpty(config.ApiKey) ? json : json.Replace(config.ApiKey, "[REDACTED]"));
+        var redactedJson = string.IsNullOrEmpty(config.ApiKey) ? json : json.Replace(config.ApiKey, "[REDACTED]");
+        _logger.LogDebug("[BTN] Request to {Host}: {Json}", host, redactedJson);
         // Sonarr sends Content-Type: application/json-rpc; BTN's PHP backend uses this to
         // identify JSON-RPC requests. Sending application/json causes it to throw ERROR 500.
         var content = new StringContent(json, Encoding.UTF8, "application/json-rpc");
 
-        var requestMessage = new HttpRequestMessage(HttpMethod.Post, $"{baseUrl}/")
+        var requestMessage = new HttpRequestMessage(HttpMethod.Post, baseUrl + "/")
         {
             Content = content
         };
@@ -517,8 +468,10 @@ public partial class BroadcasTheNetClient
         if (contentType.Contains("text/html", StringComparison.OrdinalIgnoreCase))
         {
             var htmlSnippet = await response.Content.ReadAsStringAsync();
-            _logger.LogWarning("[BTN] HTML response from {Indexer} (HTTP {Status}): {Snippet}",
-                config.Name, (int)response.StatusCode, htmlSnippet.Length > 500 ? htmlSnippet[..500] : htmlSnippet);
+            _logger.LogWarning("[BTN] HTML response from {Indexer} (HTTP {Status}): {Snippet} | Request: {Request}",
+                config.Name, (int)response.StatusCode,
+                htmlSnippet.Length > 200 ? htmlSnippet[..200] : htmlSnippet,
+                redactedJson);
             throw new IndexerRequestException($"BTN returned HTML for {config.Name} - site may be blocked or behind a captcha", HttpStatusCode.ServiceUnavailable);
         }
 
@@ -548,7 +501,11 @@ public partial class BroadcasTheNetClient
             throw new IndexerRequestException($"BTN returned unexpected response for {config.Name}: {plainText}", HttpStatusCode.InternalServerError);
         }
 
-        var result = JsonSerializer.Deserialize<T>(responseJson);
+        var result = JsonSerializer.Deserialize<T>(responseJson, new JsonSerializerOptions
+        {
+            PropertyNameCaseInsensitive = true,
+            NumberHandling = System.Text.Json.Serialization.JsonNumberHandling.AllowReadingFromString
+        });
         if (result == null)
         {
             throw new IndexerRequestException($"Failed to parse BTN response for {config.Name}", HttpStatusCode.InternalServerError);
