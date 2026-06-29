@@ -30,6 +30,7 @@ public class IndexerSearchService : IIndexerSearchService
     private readonly ILogger<IndexerSearchService> _logger;
     private readonly ILoggerFactory _loggerFactory;
     private readonly IHttpClientFactory _httpClientFactory;
+    private readonly IRateLimitService _rateLimitService;
     private readonly ReleaseEvaluator _releaseEvaluator;
     private readonly ReleaseProfileService _releaseProfileService;
     private readonly QualityDetectionService _qualityDetection;
@@ -66,6 +67,7 @@ public class IndexerSearchService : IIndexerSearchService
         SportarrDbContext db,
         ILoggerFactory loggerFactory,
         IHttpClientFactory httpClientFactory,
+        IRateLimitService rateLimitService,
         ILogger<IndexerSearchService> logger,
         ReleaseEvaluator releaseEvaluator,
         ReleaseProfileService releaseProfileService,
@@ -76,6 +78,7 @@ public class IndexerSearchService : IIndexerSearchService
         _db = db;
         _loggerFactory = loggerFactory;
         _httpClientFactory = httpClientFactory;
+        _rateLimitService = rateLimitService;
         _logger = logger;
         _releaseEvaluator = releaseEvaluator;
         _releaseProfileService = releaseProfileService;
@@ -748,18 +751,18 @@ public class IndexerSearchService : IIndexerSearchService
     {
         var httpClient = _httpClientFactory.CreateClient("BtnClient");
         var btnLogger = _loggerFactory.CreateLogger<BroadcasTheNetClient>();
-        return new BroadcasTheNetClient(httpClient, btnLogger, _qualityDetection);
+        return new BroadcasTheNetClient(httpClient, _rateLimitService, btnLogger, _qualityDetection);
     }
 
     private async Task<List<ReleaseSearchResult>> FetchBroadcasTheNetRecentAsync(Indexer indexer, int maxResults)
     {
-        using var client = CreateBtnClient();
+        var client = CreateBtnClient();
         return await client.FetchRecentAsync(indexer, maxResults);
     }
 
     private async Task<bool> TestBroadcasTheNetAsync(Indexer indexer)
     {
-        using var client = CreateBtnClient();
+        var client = CreateBtnClient();
         return await client.TestConnectionAsync(indexer);
     }
 
@@ -800,7 +803,7 @@ public class IndexerSearchService : IIndexerSearchService
 
     private async Task<List<ReleaseSearchResult>> SearchBroadcasTheNetAsync(Indexer indexer, string query, int maxResults)
     {
-        using var client = CreateBtnClient();
+        var client = CreateBtnClient();
         return await client.SearchAsync(indexer, query, maxResults);
     }
 

@@ -1,4 +1,3 @@
-using System.Collections.Concurrent;
 using System.Net;
 using System.Text;
 using System.Text.Json;
@@ -222,22 +221,20 @@ public class BroadcastheNetTorrent
 /// Implements JSON-RPC API for searching torrent releases.
 /// Rate limit: 5 seconds between requests, 150 requests/hour max.
 /// </summary>
-public partial class BroadcasTheNetClient : IDisposable
+public partial class BroadcasTheNetClient
 {
+    // Matches Sonarr's BroadcastheNet.RateLimit = TimeSpan.FromSeconds(5)
+    private static readonly TimeSpan RateLimit = TimeSpan.FromSeconds(5);
+
     private readonly HttpClient _httpClient;
+    private readonly IRateLimitService _rateLimitService;
     private readonly ILogger<BroadcasTheNetClient> _logger;
     private readonly QualityDetectionService? _qualityDetection;
 
-    // Rate limiting: 5 seconds between requests per indexer, shared across all instances.
-    // Keyed by indexer ID so per-indexer budgets are tracked independently.
-    // Entries are intentionally never removed — indexer count is small and bounded.
-    private static readonly TimeSpan RateLimitDelay = TimeSpan.FromSeconds(5);
-    private static readonly ConcurrentDictionary<int, DateTime> _lastRequestTimes = new();
-    private static readonly ConcurrentDictionary<int, SemaphoreSlim> _indexerSemaphores = new();
-
-    public BroadcasTheNetClient(HttpClient httpClient, ILogger<BroadcasTheNetClient> logger, QualityDetectionService? qualityDetection = null)
+    public BroadcasTheNetClient(HttpClient httpClient, IRateLimitService rateLimitService, ILogger<BroadcasTheNetClient> logger, QualityDetectionService? qualityDetection = null)
     {
         _httpClient = httpClient;
+        _rateLimitService = rateLimitService;
         _logger = logger;
         _qualityDetection = qualityDetection;
     }
@@ -280,11 +277,13 @@ public partial class BroadcasTheNetClient : IDisposable
     /// </summary>
     public async Task<List<ReleaseSearchResult>> SearchAsync(Indexer config, string query, int maxResults = 100)
     {
-        // Apply rate limiting
-        await ApplyRateLimitAsync(config.Id);
-
-        // Generate search variations with improved wildcard patterns
         var searchPatterns = GenerateBtnSearchPatterns(query);
+        if (searchPatterns.Count == 0)
+        {
+            _logger.LogDebug("[BTN] Empty query for {Indexer} — skipping search", config.Name);
+            return new List<ReleaseSearchResult>();
+        }
+
         var allResults = new List<ReleaseSearchResult>();
         var seenGuids = new HashSet<string>();
 
@@ -350,10 +349,7 @@ public partial class BroadcasTheNetClient : IDisposable
     {
         var patterns = new List<string>();
         if (string.IsNullOrWhiteSpace(query))
-        {
-            patterns.Add("%");
             return patterns;
-        }
 
         // Normalize the query first
         var normalized = SearchNormalizationService.NormalizeForSearch(query);
@@ -414,14 +410,7 @@ public partial class BroadcasTheNetClient : IDisposable
     /// </summary>
     public async Task<List<ReleaseSearchResult>> FetchRecentAsync(Indexer config, int maxResults = 100)
     {
-        // Apply rate limiting
-        await ApplyRateLimitAsync(config.Id);
-
-        // Query for recent releases (last 24 hours)
-        var query = new BroadcastheNetTorrentQuery
-        {
-            Age = "<=86400"  // Last 24 hours
-        };
+        var query = new BroadcastheNetTorrentQuery { Age = "<=86400" };
 
         var request = BuildJsonRpcRequest(config, "getTorrents", query, maxResults);
 
@@ -472,9 +461,11 @@ public partial class BroadcasTheNetClient : IDisposable
     {
         var baseUrl = config.Url.TrimEnd('/');
         if (string.IsNullOrEmpty(baseUrl))
-        {
             baseUrl = "https://api.broadcasthe.net";
-        }
+
+        // Rate limit every outbound call so multi-pattern searches don't fire back-to-back.
+        // Uses the shared IRateLimitService keyed on the BTN hostname + indexer ID.
+        await _rateLimitService.WaitAndPulseAsync(new Uri(baseUrl).Host, config.Id.ToString(), RateLimit);
 
         var json = JsonSerializer.Serialize(request);
         var content = new StringContent(json, Encoding.UTF8, "application/json");
@@ -489,16 +480,11 @@ public partial class BroadcasTheNetClient : IDisposable
 
         using var response = await _httpClient.SendAsync(requestMessage);
 
-        // Handle specific HTTP errors
         if (response.StatusCode == HttpStatusCode.Unauthorized)
-        {
             throw new IndexerRequestException($"BTN API key invalid for {config.Name}", HttpStatusCode.Unauthorized);
-        }
 
         if (response.StatusCode == HttpStatusCode.NotFound)
-        {
             throw new IndexerRequestException($"BTN API endpoint not found for {config.Name} - API may have changed", HttpStatusCode.NotFound);
-        }
 
         // Redirect means Cloudflare or the site is intercepting (AllowAutoRedirect is disabled for BTN).
         if ((int)response.StatusCode is >= 300 and < 400)
@@ -510,18 +496,15 @@ public partial class BroadcasTheNetClient : IDisposable
                 HttpStatusCode.ServiceUnavailable);
         }
 
-        if (response.StatusCode == HttpStatusCode.ServiceUnavailable)
+        if (!response.IsSuccessStatusCode)
         {
-            var responseBody = await response.Content.ReadAsStringAsync();
-            if (responseBody.Contains("Call Limit Exceeded", StringComparison.OrdinalIgnoreCase))
+            // Read body once and reuse for both the rate-limit check and generic error log.
+            var errorBody = await response.Content.ReadAsStringAsync();
+            if (response.StatusCode == HttpStatusCode.ServiceUnavailable &&
+                errorBody.Contains("Call Limit Exceeded", StringComparison.OrdinalIgnoreCase))
             {
                 throw new IndexerRateLimitException($"BTN rate limit exceeded for {config.Name} (150 requests/hour)", TimeSpan.FromMinutes(15));
             }
-        }
-
-        if (!response.IsSuccessStatusCode)
-        {
-            var errorBody = await response.Content.ReadAsStringAsync();
             _logger.LogWarning("[BTN] HTTP error {Status} for {Indexer}: {Body}", response.StatusCode, config.Name, errorBody);
             throw new IndexerRequestException($"BTN request failed: {response.StatusCode}", response.StatusCode);
         }
@@ -639,31 +622,6 @@ public partial class BroadcasTheNetClient : IDisposable
     }
 
     /// <summary>
-    /// Apply rate limiting delay per indexer ID. Static state survives across per-call instances.
-    /// </summary>
-    private async Task ApplyRateLimitAsync(int indexerId)
-    {
-        var semaphore = _indexerSemaphores.GetOrAdd(indexerId, _ => new SemaphoreSlim(1, 1));
-        await semaphore.WaitAsync();
-        try
-        {
-            var lastRequest = _lastRequestTimes.GetOrAdd(indexerId, DateTime.MinValue);
-            var timeSinceLastRequest = DateTime.UtcNow - lastRequest;
-            if (timeSinceLastRequest < RateLimitDelay)
-            {
-                var delay = RateLimitDelay - timeSinceLastRequest;
-                _logger.LogDebug("[BTN] Rate limiting: waiting {DelayMs}ms", delay.TotalMilliseconds);
-                await Task.Delay(delay);
-            }
-            _lastRequestTimes[indexerId] = DateTime.UtcNow;
-        }
-        finally
-        {
-            semaphore.Release();
-        }
-    }
-
-    /// <summary>
     /// Extract release group from title
     /// </summary>
     [GeneratedRegex(@"-([A-Za-z0-9]+)(?:\.[a-z]{2,4})?$")]
@@ -714,6 +672,4 @@ public partial class BroadcasTheNetClient : IDisposable
 
         return score;
     }
-
-    public void Dispose() { }
 }
