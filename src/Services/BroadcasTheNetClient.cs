@@ -57,23 +57,30 @@ public class JsonRpcError
 }
 
 /// <summary>
-/// BTN torrent query parameters
+/// BTN torrent query parameters — null properties are omitted from serialization
+/// to match Sonarr's Newtonsoft DefaultValueHandling.Ignore behaviour.
+/// BTN's API returns HTTP 200 / ERROR 500 if unexpected null fields are present.
 /// </summary>
 public class BroadcastheNetTorrentQuery
 {
     [JsonPropertyName("tvdb")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
     public int? Tvdb { get; set; }
 
     [JsonPropertyName("tvrage")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
     public int? Tvrage { get; set; }
 
     [JsonPropertyName("name")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
     public string? Name { get; set; }
 
     [JsonPropertyName("category")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
     public string? Category { get; set; }
 
     [JsonPropertyName("age")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
     public string? Age { get; set; }
 }
 
